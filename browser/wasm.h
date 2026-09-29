@@ -12,6 +12,7 @@
 #pragma once
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -26,6 +27,45 @@ struct Trap {
 
 class Instance;
 struct Reader;
+
+// Memory reserved as address space and committed only as it is needed; untouched pages
+// cost no RAM (the OS hands out zeroed pages on first use). Used for linear memory, which
+// otherwise was a std::vector that doubled (and copied) itself as a page grew, and for the
+// 8 MiB value stack, which was zero-filled up front.
+void *vm_reserve(size_t bytes);
+bool vm_commit(void *p, size_t bytes);
+void vm_release(void *p);
+
+template <class T> class VmArray {
+public:
+    VmArray() = default;
+    VmArray(const VmArray &) = delete;
+    VmArray &operator=(const VmArray &) = delete;
+    ~VmArray() { if (p_) vm_release(p_); }
+    T *data() const { return p_; }
+    size_t size() const { return n_; }
+    // Grows to n elements (new ones are zero). max: the most it may ever hold (first call).
+    bool resize(size_t n, size_t max) {
+        if (!p_) {
+            p_ = (T *)vm_reserve(max * sizeof(T));
+            if (!p_) return false;
+            cap_ = max;
+        }
+        if (n > cap_) return false;
+        size_t bytes = n * sizeof(T);
+        if (bytes > committed_) {
+            size_t want = std::min((bytes + 65535) & ~(size_t)65535, cap_ * sizeof(T));
+            if (!vm_commit((char *)p_ + committed_, want - committed_)) return false;
+            committed_ = want;
+        }
+        if (n > n_) n_ = n;
+        return true;
+    }
+
+private:
+    T *p_ = nullptr;
+    size_t n_ = 0, cap_ = 0, committed_ = 0;
+};
 
 // A host function receives its arguments in args[0..nparams) and writes its
 // results to args[0..nresults).
@@ -105,12 +145,12 @@ private:
     std::vector<uint32_t> table_;
     bool has_table_ = false, has_memory_ = false;
     uint32_t mem_max_pages_ = 65536;
-    std::vector<uint8_t> mem_;
+    VmArray<uint8_t> mem_;
     std::vector<std::vector<uint8_t>> datas_;
     uint32_t data_count_ = 0;
     std::unordered_map<std::string, uint32_t> exports_;
 
-    std::vector<uint64_t> stack_;
+    VmArray<uint64_t> stack_;
     uint64_t *stack_top_ = nullptr;
     std::vector<Frame> frames_;
     int depth_ = 0;

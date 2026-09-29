@@ -44,10 +44,35 @@ static void *sys_alloc(u32 n) {
     return p;
 }
 
+// Small blocks come in power-of-two classes. Large ones (over 64 KB) would waste up to half
+// their size that way (a 1 MB arena chunk plus its header took a 2 MB block), so they are
+// sized in 64 KB steps and reused best-fit; one at the top of the heap goes back to it.
+#define LARGE_CLS 0xFFu
+#define LARGE_STEP 65536u
+static u8 *large_free;  // freed large blocks: [u32 LARGE_CLS][u32 size][next pointer]...
+
 static void *mem_alloc(u32 n) {
+    if ((u64)n + 8 > LARGE_STEP) {
+        u64 want = ((u64)n + 8 + LARGE_STEP - 1) & ~(u64)(LARGE_STEP - 1);
+        if (want > 0xF0000000ull) return 0;
+        u8 **best = 0;
+        for (u8 **pp = &large_free; *pp; pp = (u8 **)(*pp + 8)) {
+            u32 size = *(u32 *)(*pp + 4);
+            if (size >= want && size <= want * 2 && (!best || size < *(u32 *)(*best + 4))) best = pp;
+        }
+        u8 *blk;
+        if (best) {
+            blk = *best;
+            *best = *(u8 **)(blk + 8);
+        } else {
+            if (!(blk = (u8 *)sys_alloc((u32)want))) return 0;
+            *(u32 *)(blk + 4) = (u32)want;
+        }
+        *(u32 *)blk = LARGE_CLS;
+        return blk + 8;
+    }
     u32 cls = 4;
     while (((u64)1 << cls) < (u64)n + 8) cls++;
-    if (cls > 30) return 0;
     u8 *blk = (u8 *)free_list[cls];
     if (blk) free_list[cls] = *(void **)(blk + 8);
     else if (!(blk = (u8 *)sys_alloc(1u << cls))) return 0;
@@ -59,6 +84,16 @@ static void mem_free(void *p) {
     if (!p) return;
     u8 *blk = (u8 *)p - 8;
     u32 cls = *(u32 *)blk;
+    if (cls == LARGE_CLS) {
+        u32 size = *(u32 *)(blk + 4);
+        if ((u32)(unsigned long)(blk + size) == brk_top) {  // the last block: give it back to the heap
+            brk_top = (u32)(unsigned long)blk;
+            return;
+        }
+        *(u8 **)(blk + 8) = large_free;
+        large_free = blk;
+        return;
+    }
     *(void **)(blk + 8) = free_list[cls];
     free_list[cls] = blk;
 }
@@ -85,7 +120,7 @@ static u8 *arena_cur, *arena_end;
 static void *arena(u32 n) {
     n = (n + 7) & ~7u;
     if (!arena_cur || arena_cur + n > arena_end) {
-        u32 size = n > (1u << 20) ? n : (1u << 20);
+        u32 size = n > (1u << 20) - 8 ? n : (1u << 20) - 8;  // (whole 64 KB steps with the block header)
         arena_cur = (u8 *)must_alloc(size);
         arena_end = arena_cur + size;
     }

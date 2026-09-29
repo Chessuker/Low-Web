@@ -149,6 +149,7 @@ int main(int argc, char **argv) {
         call("lw_key", {35 /* LW_KEY_END */, 0, 1});
         for (int k = 0; k < 60; k++) call("lw_frame", {from_f64(now_ms() - t0 + 1000)});
         printf("final frame fnv %016llx\n", (unsigned long long)frame_hash);
+        printf("wasm memory %.1f MB\n", inst.memory_size() / 1048576.0);
         printf("total %.0f ms in %d frames: interpreter %.0f ms, host functions %.0f ms\n", total, frames, total - host_ms, host_ms);
     } catch (const Trap &t) {
         printf("trap: %s\n", t.msg.c_str());

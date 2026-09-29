@@ -1,6 +1,12 @@
 // wasm.cpp — WebAssembly decoder, translator and interpreter. See wasm.h.
 #include "wasm.h"
 
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -217,7 +223,14 @@ struct Reader {
 
 // ---- instance -----------------------------------------------------------------
 
-Instance::Instance() : stack_(kStackSlots) { stack_top_ = stack_.data(); }
+void *vm_reserve(size_t bytes) { return VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS); }
+bool vm_commit(void *p, size_t bytes) { return VirtualAlloc(p, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr; }
+void vm_release(void *p) { VirtualFree(p, 0, MEM_RELEASE); }
+
+Instance::Instance() {
+    if (!stack_.resize(kStackSlots, kStackSlots)) throw std::bad_alloc();  // committed, but only used pages take RAM
+    stack_top_ = stack_.data();
+}
 
 int Instance::export_func(const std::string &name) const {
     auto it = exports_.find(name);
@@ -228,11 +241,7 @@ uint32_t Instance::grow(uint32_t pages) {
     uint64_t old = mem_.size() / 65536;
     uint64_t limit = std::min<uint64_t>(mem_max_pages_, max_memory_pages);
     if (!has_memory_ || old + pages > limit) return 0xFFFFFFFFu;
-    try {
-        mem_.resize((old + pages) * 65536);
-    } catch (const std::bad_alloc &) {
-        return 0xFFFFFFFFu;
-    }
+    if (!mem_.resize((old + pages) * 65536, (size_t)limit * 65536)) return 0xFFFFFFFFu;
     return (uint32_t)old;
 }
 
@@ -356,7 +365,8 @@ std::string Instance::load(const uint8_t *data, size_t size, const std::vector<H
                     uint32_t mn = s.u32();
                     if (flags & 1) mem_max_pages_ = std::min<uint32_t>(s.u32(), 65536);
                     if (mn > max_memory_pages || mn > mem_max_pages_) throw LoadError("initial memory too large");
-                    mem_.assign((size_t)mn * 65536, 0);
+                    if (!mem_.resize((size_t)mn * 65536, (size_t)std::min<uint32_t>(mem_max_pages_, max_memory_pages) * 65536))
+                        throw LoadError("not enough memory for the page");
                     has_memory_ = true;
                 }
                 break;
