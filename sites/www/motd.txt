@@ -1,0 +1,2 @@
+สวัสดีจาก lowd! ข้อความนี้อยู่ในไฟล์ motd.txt บนเซิร์ฟเวอร์ แก้ไฟล์แล้วกด Reload ได้เลย
+Hello from lowd — edit www/motd.txt on the server and reload.

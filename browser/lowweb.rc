@@ -1,0 +1,5 @@
+#include <winuser.h>
+APPICON ICON "lowweb.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "lowweb.manifest"
+// The HTML viewer page (sites/viewer), built before the browser.
+VIEWER RCDATA "viewer.wasm"

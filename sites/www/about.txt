@@ -1,0 +1,27 @@
+Low-web
+=======
+
+Low-web is a web without HTML, CSS or JavaScript.
+
+A page is one WebAssembly module (index.wasm). The browser downloads it over
+HTTP or HTTPS, runs it in its own interpreter, and shows the pixels the page
+hands back. Input, files, text rendering, image decoding and network requests
+go through a small set of functions described in sdk/lowweb.h.
+
+Pages are usually written in C and compiled with clang:
+
+    clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint
+          -msign-ext -mmutable-globals -nostdlib -fno-builtin -Wl,--no-entry -Isdk
+          -o index.wasm page.c
+
+Addresses work like on the normal web:
+
+    http://localhost:8080/        loads /index.wasm
+    http://localhost:8080/paint/  loads /paint/index.wasm
+    about.txt                     plain text is shown by the browser itself
+
+Ordinary HTML sites open too: the browser hands them to a viewer page
+(sites/viewer) that reads the HTML and draws a reader view of it.
+
+This file is plain text, so the browser shows it on its own.
+Press Alt+Left or the back button to return.
