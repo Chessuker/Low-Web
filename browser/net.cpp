@@ -119,12 +119,51 @@ std::string content_type_for(const std::string &path) {
 }
 
 
-Response load_file(const Url &u, Mode mode, size_t max_bytes, Stream *stream) {
-    Response r;
+void log_fetch(const std::string &what);
+
+// The Windows path of a file:// URL.
+std::string file_path(const Url &u) {
     std::string path = percent_decode(u.path);
     if (!u.host.empty()) path = "//" + u.host + path;                       // UNC
     else if (path.size() >= 3 && path[0] == '/' && path[2] == ':') path = path.substr(1);  // /C:/x -> C:/x
+    return path;
+}
+
+// Whether `path` is in directory `dir` or below, once both are made absolute (so "..",
+// "%2e%2e" and backslashes can't climb out).
+bool path_inside(const std::string &path, const std::string &dir) {
+    auto full = [](const std::string &p) {
+        wchar_t buf[4096];
+        DWORD n = GetFullPathNameW(widen(p).c_str(), 4096, buf, nullptr);
+        std::wstring w = n && n < 4096 ? std::wstring(buf, n) : std::wstring();
+        for (auto &ch : w) ch = ch == L'/' ? L'\\' : (wchar_t)towlower(ch);
+        return w;
+    };
+    std::wstring f = full(path), d = full(dir);
+    if (f.empty() || d.empty()) return false;
+    if (d.back() != L'\\') d += L'\\';
+    return f.compare(0, d.size(), d) == 0 || f + L'\\' == d;
+}
+
+Response blocked(const std::string &url, const std::string &why) {
+    Response r;
+    r.final_url = r.requested_url = url;
+    r.error = "blocked: " + why;
+    log_fetch("blocked " + url + ": " + why);
+    return r;
+}
+
+Response load_file(const Url &u, Mode mode, size_t max_bytes, Stream *stream, const Access &access) {
+    std::string path = file_path(u);
     std::string url = u.str();
+    if (!access.files) return blocked(url, "only a page that is itself a file may open files");
+    if (!access.file_root.empty()) {
+        Url root;
+        if (!root.parse(access.file_root) || root.scheme != "file" || !path_inside(path, file_path(root)))
+            return blocked(url, "a file page may only open files in its own folder and below");
+    }
+    Response r;
+    r.zone = Zone::Local;
     auto is_dir = [](const std::string &p) {
         DWORD at = GetFileAttributesW(widen(p).c_str());
         return at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY);
@@ -253,6 +292,7 @@ Response from_cache(const cache::Entry &e, std::string &location) {
     r.content_type = e.content_type;
     r.body = e.body;
     r.from_cache = true;
+    r.zone = (Zone)e.zone;
     location = e.location;
     return r;
 }
@@ -269,7 +309,7 @@ std::string vary_key(const std::string &cookie_header) {
 }
 
 Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::string *post, std::string &location,
-                      Stream *stream, CacheMode cmode, const cookies::Context *who) {
+                      Stream *stream, CacheMode cmode, const cookies::Context *who, const Access &access) {
     const std::string url = u.str();
     ULONGLONG t_start = GetTickCount64();
     cookies::Context ctx = who ? *who : cookies::Context{};
@@ -280,6 +320,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     cache::Entry cached;
     bool have = !post && cmode != CacheMode::Reload && cache::get(url, cached);
     if (have && !cached.vary.empty() && cached.vary != vary_key(cookie)) have = false;  // made for other cookies
+    if (have && (Zone)cached.zone < access.lowest) have = false;  // from a server this request may not reach
     if (have) {
         int64_t now = cache::now_ms();
         bool usable = cmode == CacheMode::Normal ? now < cached.fresh_until
@@ -367,6 +408,10 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     };
 
     const std::string pool_key = u.scheme + "://" + u.host + ":" + std::to_string(u.port);
+    auto connect_failed = [&](Response &res) -> Response & {
+        if (res.error.rfind("blocked: ", 0) == 0) log_fetch("blocked " + url + ": " + res.error.substr(9));
+        return res;
+    };
     std::unique_ptr<Conn> c, h1conn;  // h1conn: a new HTTPS connection whose server chose HTTP/1.1
     bool reused = false, reusable = false, via_h2 = false;
     std::string conn_note;
@@ -389,15 +434,19 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         }
         for (int attempt = 0; attempt < 2 && !h1conn; attempt++) {
             hc = attempt ? nullptr : h2::find(pool_key);
+            if (hc && hc->zone() < access.lowest)
+                return blocked(url, std::string("a page from ") + zone_name(access.lowest) + " may not reach " + zone_name(hc->zone()));
             reused = hc != nullptr;
             if (!hc) {
                 std::lock_guard<std::mutex> one_at_a_time(origin_lock(pool_key));
                 if (attempt == 0) hc = h2::find(pool_key);  // made by another request meanwhile?
+                if (hc && hc->zone() < access.lowest)
+                    return blocked(url, std::string("a page from ") + zone_name(access.lowest) + " may not reach " + zone_name(hc->zone()));
                 reused = hc != nullptr;
                 if (!hc) {
                     auto nc = std::make_unique<Conn>();
                     ULONGLONG t0 = GetTickCount64();
-                    if (!nc->connect_to(u.host, u.port, r.error)) return r;
+                    if (!nc->connect_to(u.host, u.port, r.error, access.lowest)) return connect_failed(r);
                     ULONGLONG t1 = GetTickCount64();
                     if (!nc->start_tls(u.host, r.error, true)) return r;
                     conn_note = "new connection: TCP " + std::to_string(t1 - t0) + " ms" +
@@ -424,6 +473,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         }
         if (st) {
             via_h2 = true;
+            r.zone = hc->zone();
             conn_note = (reused ? "HTTP/2, shared connection" : "HTTP/2, " + conn_note) + ", stream " + std::to_string(st->id);
             reused = false;
             r.status = st->status;
@@ -454,11 +504,16 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     for (int attempt = 0;; attempt++) {
         c = post || attempt || !g_keep_alive ? nullptr : pool_take(pool_key);  // a POST is not sent twice
         if (attempt == 0 && h1conn) c = std::move(h1conn);
+        if (c && c->zone < access.lowest) {
+            Zone z = c->zone;
+            pool_put(pool_key, std::move(c));
+            return blocked(url, std::string("a page from ") + zone_name(access.lowest) + " may not reach " + zone_name(z));
+        }
         reused = c != nullptr && conn_note.empty();
         if (!c) {
             c = std::make_unique<Conn>();
             ULONGLONG t0 = GetTickCount64();
-            if (!c->connect_to(u.host, u.port, r.error)) return r;
+            if (!c->connect_to(u.host, u.port, r.error, access.lowest)) return connect_failed(r);
             ULONGLONG t1 = GetTickCount64();
             conn_note = "new connection: TCP " + std::to_string(t1 - t0) + " ms";
             if (u.scheme == "https") {
@@ -469,6 +524,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         bool sent = c->send_all(req);
         int n = sent ? c->read(buf.data(), (int)buf.size()) : -1;
         if (n > 0) {
+            r.zone = c->zone;
             head.assign(buf.data(), n);
             break;
         }
@@ -588,6 +644,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         if (!merged.count("last-modified") && !cached.last_modified.empty()) merged["last-modified"] = cached.last_modified;
         if (cache::freshness(cached.status, merged, now, fresh)) cache::set_fresh_until(url, fresh);
         Response hit = from_cache(cached, location);
+        hit.zone = r.zone;
         if (location.empty()) stream_whole(stream, hit);
         finish(hit);
         return hit;
@@ -640,6 +697,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         if (lower(hdrs["vary"]).find("cookie") != std::string::npos) e.vary = vary_key(cookie);
         e.stored = now;
         e.fresh_until = fresh;
+        e.zone = (int)r.zone;
         e.body = r.body;
         cache::put(e);
     } else if (!post && have) {
@@ -761,7 +819,7 @@ namespace {
 
 // GET/POST with redirects, no index.wasm handling.
 Response fetch_exact(const std::string &url_in, Mode mode, size_t max_bytes, const std::string *post, Stream *stream,
-                     CacheMode cmode, const cookies::Context *who) {
+                     CacheMode cmode, const cookies::Context *who, const Access &access) {
     std::string url = url_in;
     for (int hop = 0; hop < 10; hop++) {
         Url u;
@@ -771,7 +829,7 @@ Response fetch_exact(const std::string &url_in, Mode mode, size_t max_bytes, con
             r.error = "that is not a valid address";
             return r;
         }
-        if (u.scheme == "file") return load_file(u, mode, max_bytes, stream);
+        if (u.scheme == "file") return load_file(u, mode, max_bytes, stream, access);
         if (u.scheme != "http" && u.scheme != "https") {
             Response r;
             r.final_url = r.requested_url = url;
@@ -779,7 +837,7 @@ Response fetch_exact(const std::string &url_in, Mode mode, size_t max_bytes, con
             return r;
         }
         std::string location;
-        Response r = http_request(u, mode, max_bytes, post, location, stream, cmode, who);
+        Response r = http_request(u, mode, max_bytes, post, location, stream, cmode, who, access);
         if (r.status >= 300 && r.status < 400 && r.status != 304 && !location.empty()) {
             url = resolve(u.str(), location);
             if (r.status != 307 && r.status != 308) post = nullptr;  // "see other": continue with GET
@@ -798,14 +856,14 @@ bool is_wasm(const Response &r) { return r.body.size() >= 4 && std::memcmp(r.bod
 }  // namespace
 
 Response fetch(const std::string &url, Mode mode, size_t max_bytes, const std::string *post, Stream *stream, CacheMode cmode,
-               const cookies::Context *who) {
+               const cookies::Context *who, const Access &access) {
     Url u;
     if (mode == Mode::Page && !post && u.parse(url) && (u.scheme == "http" || u.scheme == "https")) {
         std::string path = u.path.substr(0, u.path.find('?'));
         if (!path.empty() && path.back() == '/') {
             Url wasm_url = u;
             wasm_url.path.insert(path.size(), "index.wasm");
-            Response r = fetch_exact(wasm_url.str(), mode, max_bytes, nullptr, nullptr, cmode, who);  // not streamed: may be a 404 page
+            Response r = fetch_exact(wasm_url.str(), mode, max_bytes, nullptr, nullptr, cmode, who, access);  // not streamed: may be a 404 page
             if (r.status == 200 && is_wasm(r)) {
                 // show the directory, not ".../index.wasm"
                 std::string f = r.final_url;
@@ -820,7 +878,34 @@ Response fetch(const std::string &url, Mode mode, size_t max_bytes, const std::s
             }
         }
     }
-    return fetch_exact(url, mode, max_bytes, post, stream, cmode, who);
+    return fetch_exact(url, mode, max_bytes, post, stream, cmode, who, access);
+}
+
+Access access_for_page(const std::string &page_url, Zone page_zone) {
+    Access a;
+    Url u;
+    if (u.parse(page_url) && u.scheme == "file") {
+        std::string self = u.str();
+        a.file_root = self.substr(0, self.rfind('/') + 1);
+        return a;
+    }
+    a.lowest = page_zone;
+    a.files = false;
+    return a;
+}
+
+Zone zone_of_ip(const std::string &ip) {
+    sockaddr_in v4{};
+    sockaddr_in6 v6{};
+    if (InetPtonA(AF_INET, ip.c_str(), &v4.sin_addr) == 1) {
+        v4.sin_family = AF_INET;
+        return zone_of((const sockaddr *)&v4);
+    }
+    if (InetPtonA(AF_INET6, ip.c_str(), &v6.sin6_addr) == 1) {
+        v6.sin6_family = AF_INET6;
+        return zone_of((const sockaddr *)&v6);
+    }
+    return Zone::Public;
 }
 
 void set_logger(std::function<void(const std::string &)> log) { g_logger = std::move(log); }

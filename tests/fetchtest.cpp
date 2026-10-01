@@ -5,6 +5,9 @@
 // fetchtest --save DIR URL...  — write each body to DIR/N.body (N counts from 0)
 // fetchtest --cache DIR URL...  — use (and fill) an HTTP cache in DIR; --revalidate / --reload
 //   choose how (see net::CacheMode). Each request is logged: cache hit, reused connection...
+// fetchtest --page PAGE ZONE URL...  — fetch as page PAGE would (lw_fetch): with the limits of
+//   net::access_for_page(PAGE, ZONE), ZONE = local, private or public.
+// fetchtest --zone IP...  — print the address space of each IP address.
 #include <chrono>
 #include <fstream>
 #include <string>
@@ -14,6 +17,10 @@
 #include <cstdio>
 #include <cstring>
 #include "../browser/net.h"
+
+static const char *zone_word(net::Zone z) {
+    return z == net::Zone::Local ? "local" : z == net::Zone::Private ? "private" : "public";
+}
 
 struct Collect : net::Stream {
     std::vector<uint8_t> got;
@@ -34,6 +41,10 @@ int main(int argc, char **argv) {
         for (int i = 3; i < argc; i++) printf("%-14s -> %s\n", argv[i], net::resolve(argv[2], argv[i]).c_str());
         return 0;
     }
+    if (argc >= 2 && !strcmp(argv[1], "--zone")) {
+        for (int i = 2; i < argc; i++) printf("%-24s -> %s\n", argv[i], zone_word(net::zone_of_ip(argv[i])));
+        return 0;
+    }
     if (argc >= 2 && !strcmp(argv[1], "--input")) {
         for (int i = 2; i < argc; i++) printf("%-24s -> %s\n", argv[i], net::from_user_input(argv[i]).c_str());
         return 0;
@@ -41,6 +52,7 @@ int main(int argc, char **argv) {
     net::Mode mode = net::Mode::Page;
     net::CacheMode cmode = net::CacheMode::Normal;
     cookies::Context who;
+    net::Access access;
     net::set_logger([](const std::string &s) { printf("  %s\n", s.c_str()); });
     bool stream = false, parallel = false;
     std::string save_dir;
@@ -55,6 +67,11 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(argv[i], "--site") && i + 1 < argc) { who.site_for = argv[++i]; continue; }  // requests made for this page
         if (!strcmp(argv[i], "--nav")) { who.navigation = true; continue; }
+        if (!strcmp(argv[i], "--page") && i + 2 < argc) {
+            std::string page = argv[++i], z = argv[++i];
+            access = net::access_for_page(page, z == "local" ? net::Zone::Local : z == "private" ? net::Zone::Private : net::Zone::Public);
+            continue;
+        }
         if (!strcmp(argv[i], "--parallel")) { parallel = true; continue; }
         if (!strcmp(argv[i], "--save") && i + 1 < argc) { save_dir = argv[++i]; continue; }
         if (!strcmp(argv[i], "--no-h2")) { net::set_http2(false); continue; }
@@ -69,7 +86,7 @@ int main(int argc, char **argv) {
         if (parallel) { urls.push_back(argv[i]); continue; }
         double t0 = Collect::now();
         Collect c;
-        net::Response r = net::fetch(argv[i], mode, 256u << 20, nullptr, stream ? &c : nullptr, cmode, &who);
+        net::Response r = net::fetch(argv[i], mode, 256u << 20, nullptr, stream ? &c : nullptr, cmode, &who, access);
         printf("  %.0f ms%s\n", Collect::now() - t0, r.from_cache ? ", from the cache" : "");
         if (stream)
             printf("  stream: %s, %d pieces, first after %.0f ms, total %.0f ms, %s\n", c.began ? "began" : "not begun", c.pieces,
@@ -77,15 +94,15 @@ int main(int argc, char **argv) {
         if (!r.status) { printf("%s\n  ERROR: %s\n", argv[i], r.error.c_str()); continue; }
         std::string head(r.body.begin(), r.body.begin() + std::min<size_t>(r.body.size(), 60));
         for (char &c : head) if (c < 32) c = '.';
-        printf("%s\n  %d  %s  %zu bytes  final=%s  requested=%s\n  \"%s\"\n", argv[i], r.status, r.content_type.c_str(),
-               r.body.size(), r.final_url.c_str(), r.requested_url.c_str(), head.c_str());
+        printf("%s\n  %d  %s  %zu bytes  final=%s  requested=%s  zone=%s\n  \"%s\"\n", argv[i], r.status, r.content_type.c_str(),
+               r.body.size(), r.final_url.c_str(), r.requested_url.c_str(), zone_word(r.zone), head.c_str());
     }
     if (parallel) {
         double t0 = Collect::now();
         std::vector<net::Response> rs(urls.size());
         std::vector<std::thread> ts;
         for (size_t k = 0; k < urls.size(); k++)
-            ts.emplace_back([&, k] { rs[k] = net::fetch(urls[k], mode, 256u << 20, nullptr, nullptr, cmode, &who); });
+            ts.emplace_back([&, k] { rs[k] = net::fetch(urls[k], mode, 256u << 20, nullptr, nullptr, cmode, &who, access); });
         for (auto &t : ts) t.join();
         size_t bytes = 0, ok = 0;
         for (size_t k = 0; k < rs.size(); k++) {

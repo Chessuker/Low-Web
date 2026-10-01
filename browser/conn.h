@@ -16,7 +16,36 @@
 #include <string>
 #include <vector>
 
+#include "net.h"
+
 namespace net {
+
+// ---------------------------------------------------------------------------------
+// Address spaces (net.h: Zone)
+// ---------------------------------------------------------------------------------
+
+inline Zone zone_of_v4(const uint8_t *a) {
+    if (a[0] == 127 || a[0] == 0) return Zone::Local;  // loopback; 0.0.0.0 also reaches this computer
+    if (a[0] == 10 || (a[0] == 172 && (a[1] & 0xF0) == 16) || (a[0] == 192 && a[1] == 168) ||
+        (a[0] == 169 && a[1] == 254) || (a[0] == 100 && (a[1] & 0xC0) == 64) || (a[0] == 198 && (a[1] & 0xFE) == 18))
+        return Zone::Private;  // RFC 1918, link-local, carrier-grade NAT, benchmarking
+    return Zone::Public;
+}
+
+inline Zone zone_of(const sockaddr *sa) {
+    if (sa->sa_family == AF_INET) return zone_of_v4((const uint8_t *)&((const sockaddr_in *)sa)->sin_addr);
+    if (sa->sa_family != AF_INET6) return Zone::Local;
+    const uint8_t *a = (const uint8_t *)&((const sockaddr_in6 *)sa)->sin6_addr;
+    static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+    if (std::memcmp(a, mapped, 12) == 0) return zone_of_v4(a + 12);  // ::ffff:a.b.c.d
+    bool zero15 = true;
+    for (int i = 0; i < 15; i++) zero15 &= a[i] == 0;
+    if (zero15 && a[15] <= 1) return Zone::Local;                  // ::1 and ::
+    if ((a[0] & 0xFE) == 0xFC || (a[0] == 0xFE && (a[1] & 0xC0) == 0x80)) return Zone::Private;  // fc00::/7, fe80::/10
+    return Zone::Public;
+}
+
+inline const char *zone_name(Zone z) { return z == Zone::Local ? "this computer" : z == Zone::Private ? "the local network" : "the internet"; }
 
 // ---------------------------------------------------------------------------------
 // TLS over SChannel
@@ -39,6 +68,7 @@ inline std::string sec_error(SECURITY_STATUS ss) {
 
 struct Conn {
     SOCKET s = INVALID_SOCKET;
+    Zone zone = Zone::Public;  // of the address it is connected to
     bool tls = false;
     CredHandle cred{};
     CtxtHandle ctx{};
@@ -56,7 +86,9 @@ struct Conn {
     // Connects to all resolved addresses at once and keeps the first that answers
     // (a simple form of "Happy Eyeballs", RFC 8305). This matters on Windows, where a
     // refused connection (e.g. "localhost" -> ::1 with an IPv4-only server) takes ~2 s.
-    bool connect_to(const std::string &host, int port, std::string &err) {
+    // Addresses more private than `lowest` are not tried. The check is on the addresses
+    // themselves, so a name that resolves to 127.0.0.1 ("DNS rebinding") is caught too.
+    bool connect_to(const std::string &host, int port, std::string &err, Zone lowest = Zone::Local) {
         addrinfo hints{}, *res = nullptr;
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
@@ -66,17 +98,36 @@ struct Conn {
             return false;
         }
         std::vector<SOCKET> pending;
+        std::vector<Zone> zones;  // of each pending socket
         SOCKET winner = INVALID_SOCKET;
+        Zone winner_zone = Zone::Public, blocked = Zone::Public;
+        bool any_blocked = false;
         for (addrinfo *a = res; a && pending.size() < 8 && winner == INVALID_SOCKET; a = a->ai_next) {
+            Zone z = zone_of(a->ai_addr);
+            if (z < lowest) {
+                any_blocked = true;
+                blocked = z;
+                continue;
+            }
             SOCKET t = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
             if (t == INVALID_SOCKET) continue;
             u_long nb = 1;
             ioctlsocket(t, FIONBIO, &nb);
-            if (connect(t, a->ai_addr, (int)a->ai_addrlen) == 0) winner = t;
-            else if (WSAGetLastError() == WSAEWOULDBLOCK) pending.push_back(t);
-            else closesocket(t);
+            if (connect(t, a->ai_addr, (int)a->ai_addrlen) == 0) {
+                winner = t;
+                winner_zone = z;
+            } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                pending.push_back(t);
+                zones.push_back(z);
+            } else {
+                closesocket(t);
+            }
         }
         freeaddrinfo(res);
+        if (winner == INVALID_SOCKET && pending.empty() && any_blocked) {
+            err = std::string("blocked: a page from ") + zone_name(lowest) + " may not reach " + host + " (" + zone_name(blocked) + ")";
+            return false;
+        }
         bool refused = false;
         ULONGLONG deadline = GetTickCount64() + 10000;
         while (winner == INVALID_SOCKET && !pending.empty()) {
@@ -96,11 +147,14 @@ struct Conn {
                 if (done) getsockopt(t, SOL_SOCKET, SO_ERROR, (char *)&soerr, &len);
                 if (done && soerr == 0 && FD_ISSET(t, &wr) && winner == INVALID_SOCKET) {
                     winner = t;
+                    winner_zone = zones[i];
                     pending.erase(pending.begin() + i);
+                    zones.erase(zones.begin() + i);
                 } else if (done) {
                     refused |= soerr == WSAECONNREFUSED;
                     closesocket(t);
                     pending.erase(pending.begin() + i);
+                    zones.erase(zones.begin() + i);
                 } else {
                     i++;
                 }
@@ -119,6 +173,7 @@ struct Conn {
         int one = 1;
         setsockopt(winner, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
         s = winner;
+        zone = winner_zone;
         return true;
     }
 

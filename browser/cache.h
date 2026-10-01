@@ -17,6 +17,7 @@ struct Entry {
     std::string vary;                    // "Vary: Cookie": which cookies it was made for (a hash)
     int64_t stored = 0;                  // when it was received (unix ms)
     int64_t fresh_until = 0;             // usable without asking the server until then (unix ms)
+    int zone = 0;                        // net::Zone of the server that sent it (older entries: 0 = this computer)
     std::vector<uint8_t> body;           // decoded (not compressed)
 };
 

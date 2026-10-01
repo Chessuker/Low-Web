@@ -277,6 +277,8 @@ bool Connection::start() {
     return true;
 }
 
+net::Zone Connection::zone() const { return c_->zone; }
+
 bool Connection::usable() {
     std::lock_guard<std::mutex> lk(m_);
     return !dead_ && !going_away_;

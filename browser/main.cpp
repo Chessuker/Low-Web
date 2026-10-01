@@ -313,6 +313,7 @@ struct Page {
     wasm::Instance inst;
     Tab *tab = nullptr;
     std::string url;
+    net::Zone zone = net::Zone::Public;  // where the page came from: decides what it may fetch (net.h: Access)
     uint64_t gen = 0;
     double t0 = 0;
     int cursor = 0;
@@ -362,6 +363,7 @@ struct NavRequest {
     std::string body;
     int new_tab = 0;  // 0 same tab, 1 new foreground tab, 2 new background tab
     std::string initiator;  // the page that asked (for SameSite cookies)
+    net::Access access;     // what the page may send the tab to
 };
 struct LoadResult {
     int tab_id;
@@ -593,10 +595,16 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
         r->url = std::move(url);
         return r;
     };
+    // A page may send the tab anywhere on the web, as a link can. But not to the user's
+    // files unless it is a file itself, and a form it sends (POST) may not go to a server
+    // more private than the page: that is how a page from the internet would change a
+    // router's settings.
     auto post_nav = [page](NavRequest *req) {
         req->tab_id = page->tab ? page->tab->id : 0;
         req->gen = page->gen;
         req->initiator = page->url;
+        req->access.files = req->url.rfind("file:", 0) != 0 || page->url.rfind("file:", 0) == 0;
+        if (req->post) req->access.lowest = page->zone;
         PostMessageW(g_main, WM_APP_NAVIGATE, 0, (LPARAM)req);
     };
     add("navigate", "ii:", [page, post_nav, nav](Instance &in, uint64_t *a) {
@@ -632,8 +640,9 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
         int tab_id = page->tab ? page->tab->id : 0;
         net::CacheMode cm = page->tab ? page->tab->sub_cache : net::CacheMode::Normal;
         cookies::Context who{page->url, false, false};  // cookies only for the page's own site
-        std::thread([url, id, gen, tab_id, cm, who] {
-            auto *res = new FetchResult{tab_id, gen, id, net::fetch(url, net::Mode::Exact, 64u << 20, nullptr, nullptr, cm, &who)};
+        net::Access access = net::access_for_page(page->url, page->zone);
+        std::thread([url, id, gen, tab_id, cm, who, access] {
+            auto *res = new FetchResult{tab_id, gen, id, net::fetch(url, net::Mode::Exact, 64u << 20, nullptr, nullptr, cm, &who, access)};
             PostMessageW(g_main, WM_APP_FETCHED, 0, (LPARAM)res);
         }).detach();
         a[0] = (uint32_t)id;
@@ -807,9 +816,9 @@ struct DocStream : net::Stream {
 
 // mode: 0 new history entry, 1 reload, 2 history move. A reload asks the server whether the
 // page changed; a hard reload (Ctrl+F5) ignores the cache; back/forward prefer it.
-// `initiator`: the page whose link or form started this ("" = the user).
+// `initiator`: the page whose link or form started this ("" = the user); `access`: where it may lead.
 void start_load(Tab &t, const std::string &url, int mode, int hist_target = -1, const std::string *post = nullptr,
-                bool hard = false, const std::string &initiator = std::string()) {
+                bool hard = false, const std::string &initiator = std::string(), const net::Access &access = net::Access()) {
     net::CacheMode cm = hard ? net::CacheMode::Reload : mode == 1 ? net::CacheMode::Revalidate
                       : mode == 2 ? net::CacheMode::PreferCached : net::CacheMode::Normal;
     t.sub_cache = hard ? net::CacheMode::Reload : net::CacheMode::Normal;
@@ -827,7 +836,7 @@ void start_load(Tab &t, const std::string &url, int mode, int hist_target = -1, 
     std::string body = post ? *post : std::string();
     int tab_id = t.id;
     cookies::Context who{initiator, true, is_post};
-    std::thread([url, gen, mode, hist_target, is_post, body, tab_id, cm, who] {
+    std::thread([url, gen, mode, hist_target, is_post, body, tab_id, cm, who, access] {
         auto *res = new LoadResult{tab_id, gen, url, mode, hist_target, {}};
         if (url.rfind("about:", 0) == 0) {
             res->r.status = 200;
@@ -840,7 +849,7 @@ void start_load(Tab &t, const std::string &url, int mode, int hist_target = -1, 
             stream.url = url;
             stream.mode = mode;
             stream.hist_target = hist_target;
-            res->r = net::fetch(url, net::Mode::Page, 256u << 20, is_post ? &body : nullptr, &stream, cm, &who);
+            res->r = net::fetch(url, net::Mode::Page, 256u << 20, is_post ? &body : nullptr, &stream, cm, &who, access);
         }
         PostMessageW(g_main, WM_APP_LOADED, 0, (LPARAM)res);
     }).detach();
@@ -914,11 +923,12 @@ void stream_begin(Tab &t, const net::Response &head);
 // Instantiates a page in a tab. `doc`, if given, is a document the page should display
 // (the HTML viewer gets the HTML this way, as fetch id 0). With `streamed`, `doc` has no
 // body yet: it follows through stream_data() and stream_end().
-void start_wasm_page(Tab &t, const std::vector<uint8_t> &module, const std::string &url, const net::Response *doc,
-                     bool streamed = false) {
+void start_wasm_page(Tab &t, const std::vector<uint8_t> &module, const std::string &url, net::Zone zone,
+                     const net::Response *doc, bool streamed = false) {
     auto page = std::make_unique<Page>();
     page->tab = &t;
     page->url = url;
+    page->zone = zone;
     page->gen = t.nav_gen;
     page->t0 = steady_ms();
     page->inst.time_limit_ms = doc ? 20000 : 5000;  // the viewer may need a while for huge documents
@@ -1004,14 +1014,14 @@ void commit(Tab &t, LoadResult &lr, bool streamed = false) {
         t.title = h;
         show_doc(t, h, body, false);
     } else if (r.body.size() >= 4 && std::memcmp(r.body.data(), "\0asm", 4) == 0) {
-        start_wasm_page(t, r.body, url, nullptr);
+        start_wasm_page(t, r.body, url, r.zone, nullptr);
     } else if (is_html(ct, r.body)) {
         std::vector<uint8_t> viewer = viewer_module();
         if (viewer.empty()) {
             t.title = L"HTML page";
             show_doc(t, L"This is an HTML page", L"The HTML viewer (viewer.wasm) is missing from this build.\n\n" + widen(url), true);
         } else {
-            start_wasm_page(t, viewer, url, &r, streamed);
+            start_wasm_page(t, viewer, url, r.zone, &r, streamed);
         }
     } else if (r.status >= 400) {
         t.title = widen("HTTP " + std::to_string(r.status));
@@ -2009,9 +2019,9 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!t || !t->page || t->page->gen != req->gen) return 0;
         if (req->new_tab) {
             Tab &nt = new_tab("", req->new_tab == 1);
-            start_load(nt, req->url, 0, -1, req->post ? &req->body : nullptr, false, req->initiator);
+            start_load(nt, req->url, 0, -1, req->post ? &req->body : nullptr, false, req->initiator, req->access);
         } else {
-            start_load(*t, req->url, 0, -1, req->post ? &req->body : nullptr, false, req->initiator);
+            start_load(*t, req->url, 0, -1, req->post ? &req->body : nullptr, false, req->initiator, req->access);
         }
         return 0;
     }

@@ -123,6 +123,7 @@ bool disk_get(const std::string &url, Entry &e) {
         else if (k == "vary") e.vary = v;
         else if (k == "stored") e.stored = _atoi64(v.c_str());
         else if (k == "fresh") e.fresh_until = _atoi64(v.c_str());
+        else if (k == "zone") e.zone = atoi(v.c_str());
     }
     if (e.url != url) return false;  // another URL with the same hash
     e.body.assign(d.begin() + p, d.end());
@@ -164,7 +165,7 @@ void trim_later() {
 void disk_put(const Entry &e) {
     std::string head = "LWC1\nurl " + e.url + "\nstatus " + std::to_string(e.status) + "\ntype " + e.content_type +
                        "\nlocation " + e.location + "\netag " + e.etag + "\nlastmod " + e.last_modified + "\nvary " + e.vary + "\nstored " +
-                       std::to_string(e.stored) + "\nfresh " + std::to_string(e.fresh_until) + "\n\n";
+                       std::to_string(e.stored) + "\nfresh " + std::to_string(e.fresh_until) + "\nzone " + std::to_string(e.zone) + "\n\n";
     std::wstring path = path_for(e.url);
     wchar_t suffix[40];
     swprintf(suffix, 40, L".%lu.tmp", GetCurrentThreadId());

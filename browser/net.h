@@ -27,6 +27,23 @@ std::string resolve(const std::string &base, const std::string &ref);
 // Turns what the user typed into a URL: adds http://, converts Windows paths to file://.
 std::string from_user_input(const std::string &typed);
 
+// Address spaces, from the most to the least private ("Private Network Access").
+enum class Zone { Local, Private, Public };  // this computer; the local network; the internet
+
+// What a request may reach. Servers on this computer and on the local network (routers,
+// printers, development servers) often trust whoever can connect to them, and the user's
+// files are the user's: a page from the internet must not use the browser to get at them.
+struct Access {
+    Zone lowest = Zone::Local;  // the most private address space it may connect to
+    bool files = true;          // file:// addresses at all
+    std::string file_root;      // if set: only files in this directory (a file:// URL ending in '/') and below
+};
+
+// The usual rules for what a page may fetch: as private as the page itself and no further
+// (a page on the internet: only the internet); file:// only for a page that is a file,
+// and then only next to it and below.
+Access access_for_page(const std::string &page_url, Zone page_zone);
+
 struct Response {
     int status = 0;                 // HTTP status, or 200 for files; 0 if the request failed
     std::string error;              // set when status == 0
@@ -35,6 +52,7 @@ struct Response {
     std::string requested_url;      // the last URL actually requested (may end in index.wasm)
     std::vector<uint8_t> body;
     bool from_cache = false;        // served from the HTTP cache (maybe after a "not modified")
+    Zone zone = Zone::Public;       // where the answer came from (file:// = Local)
 };
 
 enum class Mode {
@@ -68,8 +86,14 @@ struct Stream {
 // also handed over piece by piece as it arrives; the returned Response still has all of it.
 // `who`: the page the request is for (cookies are sent and stored only for its own site);
 // null = the user (a typed address): all of the site's cookies.
+// `access`: what the request (and every redirect it follows) may reach; else it fails
+// with an error that starts with "blocked:".
 Response fetch(const std::string &url, Mode mode, size_t max_bytes = 256u << 20, const std::string *post = nullptr,
-               Stream *stream = nullptr, CacheMode cache = CacheMode::Normal, const cookies::Context *who = nullptr);
+               Stream *stream = nullptr, CacheMode cache = CacheMode::Normal, const cookies::Context *who = nullptr,
+               const Access &access = Access());
+
+// The address space an IP address belongs to (a literal such as "10.0.0.1" or "::1").
+Zone zone_of_ip(const std::string &ip);
 
 // Where "[net] ..." lines about each request go (off by default).
 void set_logger(std::function<void(const std::string &)> log);

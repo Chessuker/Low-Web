@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "net.h"
+
 namespace net {
 struct Conn;
 }
@@ -69,6 +71,7 @@ public:
     std::shared_ptr<Stream> request(const Headers &headers, const std::string *body);
     bool usable();
     const std::string &key() const { return key_; }
+    net::Zone zone() const;  // of the server's address
 
 private:
     void reader();
