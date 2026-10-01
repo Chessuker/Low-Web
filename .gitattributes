@@ -1,0 +1,4 @@
+# Line endings that don't depend on anyone's core.autocrlf (CI checks out on Windows too):
+# bash stops at a CR, and cmd mishandles labels and goto in a batch file with bare LF.
+*.sh  text eol=lf
+*.cmd text eol=crlf

@@ -114,3 +114,4 @@ for c in cases:
     if not ok: bad += 1
     print(f'{name:22s} {"ok  " if ok else "FAIL"} {w}x{h} mean_diff={mean:.3f} max_diff={mx}')
 print('ALL OK' if not bad else f'{bad} FAILED')
+sys.exit(1 if bad else 0)

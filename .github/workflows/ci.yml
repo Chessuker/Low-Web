@@ -1,0 +1,86 @@
+# Builds everything and runs the tests that need nothing but the repository
+# (tests/run_tests.py), on every push and pull request. lowd is also built and tried on Linux.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:  # a newer push to the same branch makes an older run pointless
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # g++ (MinGW-w64, with windres) and clang with the wasm32 target and wasm-ld, as build.cmd needs
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+      - name: Put the compilers first on PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Python packages for the image tests
+        run: python -m pip install --disable-pip-version-check pillow numpy
+
+      - name: Tool versions
+        shell: pwsh
+        run: |
+          g++ --version | Select-Object -First 1
+          clang --version | Select-Object -First 1
+          python --version
+          node --version
+
+      - name: Build (build.cmd)
+        shell: pwsh
+        run: |
+          cmd /c build.cmd *> build.log
+          $code = $LASTEXITCODE
+          Get-Content build.log
+          # compiler warnings show up as annotations on the run (they don't fail it)
+          Select-String -Path build.log -Pattern 'warning:' | ForEach-Object { Write-Output "::warning::$($_.Line)" }
+          exit $code
+
+      - name: Tests (tests/run_tests.py)
+        run: python tests/run_tests.py
+
+      - name: Site server (tests/check_lowd.sh)
+        shell: bash
+        run: bash tests/check_lowd.sh bin/lowd.exe
+
+      - name: Keep the browser and the server
+        uses: actions/upload-artifact@v4
+        with:
+          name: lowweb-windows
+          path: |
+            bin/lowweb.exe
+            bin/lowd.exe
+          retention-days: 14
+
+  lowd-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build lowd
+        run: mkdir -p build && g++ -std=c++20 -O2 -Wall -Wextra -pthread -o build/lowd server/lowd.cpp
+      - name: Site server (tests/check_lowd.sh)
+        run: bash tests/check_lowd.sh build/lowd

@@ -1,5 +1,7 @@
 # Low-web
 
+[![CI](https://github.com/Chessuker/Low-Web/actions/workflows/ci.yml/badge.svg)](https://github.com/Chessuker/Low-Web/actions/workflows/ci.yml)
+
 เว็บที่ไม่มี HTML, CSS หรือ JavaScript และ browser ที่เขียนขึ้นเองสำหรับมัน
 
 หน้าเว็บของ Low-web คือโปรแกรม WebAssembly หนึ่งไฟล์ (`index.wasm`) ที่วาดพิกเซลเองทั้งหมด
@@ -101,6 +103,27 @@ bin\lowweb.exe https://th.wikipedia.org/wiki/ภาษาไทย   :: เว�
   log (`--log`) มีบรรทัด `[net]` บอกทุก request ว่ามาจาก cache, connection เดิม/ใหม่, TLS แบบย่อ หรือ HTTP/2 stream ไหน
   (ตอนรันด้วย `--script` cookie อยู่ในหน่วยความจำเท่านั้น ไม่ปนกับของผู้ใช้)
 
+**หน้าเว็บเข้าถึงอะไรได้บ้าง** (`net::Access` ใน `browser/net.h`)
+
+หน้าเว็บอ่านผลของ `lw_fetch` ได้ทุกไบต์ (viewer ต้องถอดรูปและ CSS เอง) จึงต้องกันไม่ให้หน้าเว็บจากอินเทอร์เน็ต
+ใช้ browser เป็นทางเข้าไปหาของที่มีแค่เครื่องเราเข้าถึงได้ แบ่ง address เป็น 3 ระดับตาม IP **หลัง resolve DNS แล้ว**
+(ชื่อที่ชี้มา 127.0.0.1 ก็โดนกัน): **เครื่องนี้** (127.0.0.0/8, ::1), **วงแลน** (10/8, 172.16/12, 192.168/16, 169.254/16,
+100.64/10, fc00::/7, fe80::/10) และ **อินเทอร์เน็ต**
+
+| หน้าเว็บมาจาก | `lw_fetch` (รูป, CSS, ข้อมูล) | ลิงก์ (`lw_navigate`) | ส่งฟอร์ม POST |
+|---|---|---|---|
+| อินเทอร์เน็ต | อินเทอร์เน็ตเท่านั้น | ที่ไหนก็ได้ ยกเว้น `file://` | อินเทอร์เน็ตเท่านั้น |
+| วงแลน | วงแลน + อินเทอร์เน็ต | ที่ไหนก็ได้ ยกเว้น `file://` | วงแลน + อินเทอร์เน็ต |
+| เครื่องนี้ (`localhost`, `lowd`) | ทุกที่ ยกเว้น `file://` | ที่ไหนก็ได้ ยกเว้น `file://` | ทุกที่ |
+| ไฟล์ (`file://`) | ไฟล์ในโฟลเดอร์เดียวกันและโฟลเดอร์ย่อย + ทุก server | ที่ไหนก็ได้ | ทุกที่ |
+
+- ตรวจทุก redirect และทุก connection: redirect ไป 127.0.0.1 หรือ `file://` ก็ถูกกัน, connection ที่ค้างใน pool และของใน
+  HTTP cache จำไว้ว่ามาจากระดับไหน (หน้าเว็บจากอินเทอร์เน็ตจึงอ่านหน้า router ที่เคยเปิดไว้ใน cache ไม่ได้)
+- path ของไฟล์ตรวจหลังแปลงเป็น path เต็มแล้ว (`..`, `%2e%2e`, `%5c` ออกนอกโฟลเดอร์ไม่ได้)
+- ผู้ใช้เองพิมพ์ address ไปที่ไหนก็ได้เหมือนเดิม; ที่ถูกกันจะได้ error ที่ขึ้นต้นด้วย `blocked:` และมีบรรทัด `[net] blocked …` ใน log
+- ยังไม่ใช่ same-origin policy เต็มรูปแบบ: หน้าเว็บยังอ่านข้อมูลสาธารณะจากเว็บอื่นได้ แต่ส่ง cookie ไปให้เว็บอื่นไม่ได้
+  (third-party cookie ถูกปิดอยู่แล้ว) จึงอ่านได้แค่สิ่งที่ใครก็โหลดได้อยู่แล้ว
+
 address ทำงานเหมือนเว็บปกติ:
 - path ที่ลงท้ายด้วย `/` จะลองโหลด `index.wasm` ในโฟลเดอร์นั้นก่อน ถ้าไม่มี (หรือไม่ใช่ wasm) จะขอ URL เดิมตรง ๆ
   เว็บทั่วไปจึงได้หน้าแรกปกติของมัน
@@ -166,8 +189,15 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 
 ## การทดสอบ
 
+ทุก push และ pull request บน GitHub ถูก build และทดสอบอัตโนมัติ (`.github/workflows/ci.yml`): `build.cmd` + `tests/run_tests.py`
++ `tests/check_lowd.sh` บน Windows, และ build `lowd` + `check_lowd.sh` บน Ubuntu; ได้ `lowweb.exe` กับ `lowd.exe` เป็น artifact
+ให้ดาวน์โหลด (เก็บ 14 วัน) และ warning ของ compiler จะขึ้นเป็น annotation
+
 | คำสั่ง | ทดสอบอะไร |
 |---|---|
+| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/check_access.py` | หน้าเว็บเข้าถึงอะไรได้: ระดับของ IP, หน้าเว็บจากอินเทอร์เน็ต/วงแลนเข้า 127.0.0.1, `localhost`, `[::1]` ไม่ได้, redirect ไป `file://`, ของใน cache, ไฟล์นอกโฟลเดอร์ (`..`, `%2e%2e`, `%5c`) |
+| `bash tests/check_lowd.sh [LOWD]` | `lowd`: ส่ง `index.wasm`, redirect โฟลเดอร์, 404, กัน `..`/`%2e%2e`, ปฏิเสธ POST, HEAD |
 | `node tests/check_ops.mjs` เทียบกับ `bin\wasmrun build\ops.wasm "int32()" "int64()" "floats()" "control()" "memory_ops()"` | interpreter ให้ผลตรงกับ V8 ทุกบิต (integer, float, control flow, memory, traps); `wasmrun --no-fuse` รันแบบไม่รวมคำสั่ง ต้องได้ผลเท่ากัน |
 | `python tests/check_images.py` | decoder ตรงกับ PIL (PNG ทุกชนิด, JPEG baseline/progressive/subsampling/restart/EXIF, GIF, BMP) และ **WebP ตรงกับ libwebp ทุก pixel** |
 | `python tests/check_cookies.py` | cookie: กฎทั้งหมดของ jar (`bin\cookietest`: domain, path, Secure, อายุ, SameSite, third-party, prefix, การบันทึกไฟล์) และผ่าน HTTP จริง: cookie จาก redirect ไปถึงหน้าถัดไป, cache ที่ `Vary: Cookie` ไม่ถูกใช้ซ้ำเมื่อ cookie เปลี่ยน |
@@ -185,10 +215,11 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 
 ## ข้อจำกัดที่รู้อยู่
 
-- browser รันบน Windows (Win32 + SChannel); `lowd` เขียนให้ build บน Linux ได้แต่ยังไม่ได้ทดสอบบน Linux
+- browser รันบน Windows (Win32 + SChannel); `lowd` build และทดสอบบน Linux ใน CI
 - หน้าเว็บรันบน UI thread ด้วย interpreter (รวมคำสั่งที่เจอบ่อยเป็นคำสั่งเดียวตอนโหลด + threaded dispatch: เร็วขึ้น ~2 เท่า
   เทียบกับแบบเดิม; ยังไม่มี JIT): งานหนัก ๆ (เช่นเทสีทั้งผืนใน Paint) ใช้เวลา ~0.1 วินาที,
   หน้า Wikipedia ขนาด 3 MB: parse ~0.12 วินาที, จัดหน้าครั้งแรก ~0.29 วินาที (จัดใหม่ตอนรูปมา ~0.08 วินาที),
   จอแรกขึ้นประมาณ 0.4 วินาทีหลังกด Enter ครั้งแรก และ ~0.2 วินาทีเมื่อ CSS อยู่ใน cache แล้ว; หน้า Low-web ที่ค้างเกิน 5 วินาที (viewer: 20 วินาที) จะถูกหยุด
-- ยังไม่มี same-origin policy หรือ TLS 1.3 (SChannel ของ Windows 10 ยังไม่เปิด TLS 1.3 ให้ฝั่ง client จึงใช้ TLS 1.2)
-- หน้าเว็บ `lw_fetch` ได้ทุก URL: อย่าเปิดหน้าเว็บที่ไม่ไว้ใจ ถ้าในเครื่องมีบริการ HTTP ภายในที่สำคัญ
+- ยังไม่มี TLS 1.3 (SChannel ของ Windows 10 ยังไม่เปิด TLS 1.3 ให้ฝั่ง client จึงใช้ TLS 1.2)
+- กันหน้าเว็บจากอินเทอร์เน็ตไม่ให้เข้าเครื่องนี้/วงแลน/ไฟล์ได้แล้ว (ดู "หน้าเว็บเข้าถึงอะไรได้บ้าง") แต่ยังไม่มี same-origin policy
+  เต็มรูปแบบ
