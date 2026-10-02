@@ -72,6 +72,8 @@ static std::vector<HostImport> lw_stubs() {
     });
     add("image_free", "i:", [](Instance &, uint64_t *a) { images.erase((int)a[0]); });
     add("text", "iiiiiiiiii:i", [](Instance &, uint64_t *a) { a[0] = 0; });
+    add("clipboard_set", "ii:", [](Instance &, uint64_t *) {});
+    add("clipboard_get", "ii:i", [](Instance &, uint64_t *a) { a[0] = (uint32_t)-1; });
     add("text_width", "iiii:i", [](Instance &, uint64_t *a) { a[0] = 0; });
     return v;
 }

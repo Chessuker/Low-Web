@@ -82,7 +82,7 @@ enum {
     LW_KEY_BACKSPACE = 8, LW_KEY_TAB = 9, LW_KEY_ENTER = 13, LW_KEY_ESCAPE = 27,
     LW_KEY_SPACE = 32, LW_KEY_PAGEUP = 33, LW_KEY_PAGEDOWN = 34, LW_KEY_END = 35,
     LW_KEY_HOME = 36, LW_KEY_LEFT = 37, LW_KEY_UP = 38, LW_KEY_RIGHT = 39,
-    LW_KEY_DOWN = 40, LW_KEY_DELETE = 46,
+    LW_KEY_DOWN = 40, LW_KEY_INSERT = 45, LW_KEY_DELETE = 46,
     LW_KEY_F1 = 112, // F1..F12 = 112..123
     LW_KEY_LBRACKET = 219, LW_KEY_RBRACKET = 221,
 };
@@ -150,6 +150,15 @@ LW_IMPORT(text_width) int lw_text_width(const char *s, int len, int size_px, int
 // which has no spaces, breaks between words). Sets out[i] = 1 if a line may break before
 // byte i, else 0. `out` must hold len bytes.
 LW_IMPORT(line_breaks) void lw_line_breaks(const char *s, int len, unsigned char *out);
+
+// The clipboard, as UTF-8 text. lw_clipboard_set works while the page handles the user's
+// input (a key, a click, typing): pages can't overwrite the clipboard on their own.
+// lw_clipboard_get works only while the page handles a paste key (Ctrl+V, Shift+Insert),
+// so a page can't read the clipboard behind the user's back. It copies at most cap bytes
+// to buf and returns the whole text's length (call again with a bigger buffer if it is
+// more than cap), or -1 if there is no text or reading isn't allowed now.
+LW_IMPORT(clipboard_set) void lw_clipboard_set(const char *s, int len);
+LW_IMPORT(clipboard_get) int lw_clipboard_get(char *buf, int cap);
 
 // ---- helpers ----------------------------------------------------------------
 

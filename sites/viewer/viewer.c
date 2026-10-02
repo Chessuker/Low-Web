@@ -773,6 +773,12 @@ static void add_text(const u8 *s, int len, int raw) {
     }
     u8 *buf = scratch_buf(len + 1);
     int n = raw ? (__builtin_memcpy(buf, s, (u32)len), len) : decode_entities(s, len, buf);
+    int m = 0;  // line ends as HTML reads them: CR LF and a lone CR are LF
+    for (int i = 0; i < n; i++) {
+        if (buf[i] != 0x0D) buf[m++] = buf[i];
+        else if (i + 1 >= n || buf[i + 1] != 0x0A) buf[m++] = 0x0A;
+    }
+    n = m;
     if (!in_pre) {  // collapse whitespace
         int k = 0, sp_ = 0;
         for (int i = 0; i < n; i++) {
@@ -1588,6 +1594,8 @@ typedef struct {
 } Control;
 static Control *controls;
 static int ncontrols, controls_cap, focus = -1;
+static int focus_all;  // the focused text field's whole value is selected (Ctrl+A)
+#define C_SELECTION RGB(179, 215, 255)
 
 static int text_content(Node *n, char *out, int cap, int k) {
     for (Node *c = n->first; c; c = c->next) {
@@ -2637,6 +2645,8 @@ static void draw_control(Item *it, int y) {
                     start++;
                     while (start < k->vlen && (k->value[start] & 0xC0) == 0x80) start++;
                 }
+                if (it->ref == focus && focus_all)
+                    fill(tx, ty, text_w(k->value + start, k->vlen - start, &cs), ascent(cs.size) + descent(cs.size), C_SELECTION);
                 lw_text(fb, W, H, tx, ty, k->value + start, k->vlen - start, cs.size, 0, C_TEXT);
             }
         } else {
@@ -2696,14 +2706,175 @@ static int display_url(const char *href, char *out, int cap) {
     return k;
 }
 
+// ---- selecting text ------------------------------------------------------------------
+// The two ends of the selection are places in the text items' strings: pointers into the
+// document's text, which stays where it is when the page is laid out again (the items
+// don't), so the selection survives relayouts. Item indexes are looked up when needed.
+
+static const char *sel_a, *sel_b;  // where the selection started, where it ends now; 0 = none
+static int sel_drag;               // the left button is down and the mouse has moved: selecting
+static int press_down, press_x, press_y;
+static const char *press_pos;      // the text place where the button went down
+static double last_press_t;
+static int press_count;            // 1 click, 2 double click (a word), 3 triple click (a paragraph)
+static int drag_x, drag_y;         // the mouse, while selecting (it may be outside the view)
+
+static int item_w(const Item *it, int len) {
+    Style st;
+    __builtin_memset(&st, 0, sizeof st);
+    st.size = it->size;
+    st.flags = it->flags;
+    return len <= 0 ? 0 : len >= it->len ? it->w : text_w(it->s, len, &st);
+}
+
+static int is_mark(const u8 *p) {  // a combining mark: no caret before it (Thai vowels and tones above and below)
+    u32 cp = p[0] == 0xE0 && p[1] == 0xB8 ? 0x0E00 + (p[2] & 0x3F) : p[0] == 0xE0 && p[1] == 0xB9 ? 0x0E40 + (p[2] & 0x3F)
+           : p[0] == 0xCC || (p[0] == 0xCD && p[1] < 0xB0) ? 0x300 : 0;
+    return cp == 0x300 || cp == 0x0E31 || (cp >= 0x0E34 && cp <= 0x0E3A) || (cp >= 0x0E47 && cp <= 0x0E4E);
+}
+
+static int next_boundary(const Item *it, int k) {
+    k += utf8_len((u8)it->s[k]);
+    while (k < it->len && it->len - k >= 2 && is_mark((const u8 *)it->s + k)) k += utf8_len((u8)it->s[k]);
+    return k > it->len ? it->len : k;
+}
+
+static int item_of(const char *p) {
+    if (!p) return -1;
+    for (int i = 0; i < draw_limit; i++)
+        if (items[i].kind == IT_TEXT && p >= items[i].s && p <= items[i].s + items[i].len) return i;
+    return -1;
+}
+
+// The text place nearest to (x, y) in the view: on the line under it the closest character
+// boundary; left or right of a line its start or end.
+static const char *text_pos_at(int x, int y) {
+    int dy = y + scroll_y, best = -1;
+    long long best_d = 1LL << 62;
+    for (int i = 0; i < draw_limit; i++) {
+        Item *it = &items[i];
+        if (it->kind != IT_TEXT || !it->len) continue;
+        long long d = dy < it->y ? (long long)(it->y - dy) << 16 : dy >= it->y + it->h ? (long long)(dy - it->y - it->h + 1) << 16 : 0;
+        d += x < it->x ? it->x - x : x >= it->x + it->w ? x - it->x - it->w + 1 : 0;
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    if (best < 0) return 0;
+    Item *it = &items[best];
+    if (x <= it->x) return it->s;
+    if (x >= it->x + it->w) return it->s + it->len;
+    int k = 0, kw = 0;
+    while (k < it->len) {
+        int n = next_boundary(it, k), nw = item_w(it, n);
+        if (x - it->x < (kw + nw) / 2) break;
+        k = n;
+        kw = nw;
+    }
+    return it->s + k;
+}
+
+// The selection in document order: items i0..i1, from p0 in i0 to p1 in i1. 0 if none.
+static int sel_range(int *i0, const char **p0, int *i1, const char **p1) {
+    if (!sel_a || !sel_b || sel_a == sel_b) return 0;
+    int ia = item_of(sel_a), ib = item_of(sel_b);
+    if (ia < 0 || ib < 0) return 0;
+    if (ia < ib || (ia == ib && sel_a < sel_b)) { *i0 = ia; *p0 = sel_a; *i1 = ib; *p1 = sel_b; }
+    else { *i0 = ib; *p0 = sel_b; *i1 = ia; *p1 = sel_a; }
+    return 1;
+}
+
+static int same_line(const Item *a, const Item *b) { return a->y + a->asc == b->y + b->asc; }
+
+// What goes between two neighbouring text items when they are copied.
+static int item_gap(const Item *prev, const Item *it, char *out) {
+    const char *pe = prev->s + prev->len;
+    if (it->s >= pe && it->s - pe < 64) {  // the same text node: copy what is between (spaces, newlines in <pre>)
+        int ws = 1;
+        for (const char *q = pe; q < it->s && ws; q++) ws = *q == ' ' || *q == '\n' || *q == '\t';
+        if (ws) {
+            int n = (int)(it->s - pe);
+            if (out) __builtin_memcpy(out, pe, (u32)n);
+            return n;
+        }
+    }
+    const char *g = same_line(prev, it) ? (it->x > prev->x + prev->w ? " " : "")
+                  : it->y - (prev->y + prev->h) > prev->h / 3 ? "\n\n" : "\n";
+    int n = lw_strlen(g);
+    if (out) __builtin_memcpy(out, g, (u32)n);
+    return n;
+}
+
+// The selected text as UTF-8 (out = 0: just its length).
+static int selection_text(char *out) {
+    int i0, i1, k = 0;
+    const char *p0, *p1;
+    if (!sel_range(&i0, &p0, &i1, &p1)) return 0;
+    Item *prev = 0;
+    for (int i = i0; i <= i1; i++) {
+        Item *it = &items[i];
+        if (it->kind != IT_TEXT) continue;
+        const char *a = i == i0 ? p0 : it->s, *b = i == i1 ? p1 : it->s + it->len;
+        if (prev) k += item_gap(prev, it, out ? out + k : 0);
+        if (out) __builtin_memcpy(out + k, a, (u32)(b - a));
+        k += (int)(b - a);
+        prev = it;
+    }
+    return k;
+}
+
+static void copy_selection(void) {
+    int n = selection_text(0);
+    if (n <= 0) return;
+    char *buf = (char *)must_alloc((u32)n);
+    selection_text(buf);
+    lw_clipboard_set(buf, n);
+    mem_free(buf);
+}
+
+static void select_all_text(void) {
+    sel_a = sel_b = 0;
+    for (int i = 0; i < draw_limit; i++)
+        if (items[i].kind == IT_TEXT && items[i].len) {
+            if (!sel_a) sel_a = items[i].s;
+            sel_b = items[i].s + items[i].len;
+        }
+    dirty = 1;
+}
+
+// A double click selects the word (the text item: words are laid out one by one), a triple
+// click the run of text it belongs to.
+static void select_around(const char *p, int what) {
+    int i = item_of(p);
+    if (i < 0) return;
+    int a = i, b = i;
+    if (what == 3) {
+        while (a > 0 && items[a - 1].kind == IT_TEXT && items[a].s > items[a - 1].s &&
+               items[a].s - (items[a - 1].s + items[a - 1].len) == 1 && items[a].s[-1] == ' ') a--;
+        while (b + 1 < draw_limit && items[b + 1].kind == IT_TEXT && items[b + 1].s > items[b].s &&
+               items[b + 1].s - (items[b].s + items[b].len) == 1 && items[b + 1].s[-1] == ' ') b++;
+    }
+    sel_a = items[a].s;
+    sel_b = items[b].s + items[b].len;
+    dirty = 1;
+}
+
 static void redraw(void) {
     u32 page_bg = has_body_bg ? body_bg : RGB(255, 255, 255);
     fill_span(fb, W * H, page_bg);
     int top = scroll_y, bottom = scroll_y + H;
+    int s0 = -1, s1 = -1;
+    const char *q0 = 0, *q1 = 0;
+    if (!sel_range(&s0, &q0, &s1, &q1)) s0 = s1 = -1;
     for (int i = 0; i < draw_limit; i++) {
         Item *it = &items[i];
         if (it->y > bottom || it->y + it->h < top) continue;
         int y = it->y - scroll_y;
+        if (it->kind == IT_TEXT && i >= s0 && i <= s1) {  // selected: a background behind the text
+            int x0 = it->x + (i == s0 ? item_w(it, (int)(q0 - it->s)) : 0);
+            int x1 = it->x + (i == s1 ? item_w(it, (int)(q1 - it->s)) : it->w);
+            if (i < s1 && i + 1 < draw_limit && items[i + 1].kind == IT_TEXT && same_line(it, &items[i + 1]) && items[i + 1].x > x1)
+                x1 = items[i + 1].x;  // and the space to the next word
+            if (x1 > x0) fill(x0, y, x1 - x0, it->h, C_SELECTION);
+        }
         switch (it->kind) {
         case IT_TEXT: draw_text_item(it, y, it->link >= 0 && it->link == hover_link); break;
         case IT_RECT:
@@ -2897,7 +3068,12 @@ static void activate_control(int idx) {
     if (k->disabled) return;
     focus = -1;
     switch (k->kind) {
-    case K_TEXT: case K_PASSWORD: case K_TEXTAREA: focus = idx; caret_t = lw_now(); break;
+    case K_TEXT: case K_PASSWORD: case K_TEXTAREA:
+        focus = idx;
+        focus_all = 0;
+        sel_a = sel_b = 0;  // typing goes to the field now, and so does Ctrl+C
+        caret_t = lw_now();
+        break;
     case K_CHECKBOX: k->checked = !k->checked; break;
     case K_RADIO:
         for (int i = 0; i < ncontrols; i++)
@@ -2979,6 +3155,19 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
         }
         return LW_CURSOR_HAND;
     }
+    drag_x = x;
+    drag_y = y;
+    if (press_down && kind == LW_MOVE && !sel_drag && (x - press_x) * (x - press_x) + (y - press_y) * (y - press_y) > 16) {
+        sel_drag = 1;  // the press became a drag: select text (and don't follow the link it started on)
+        pressed_link = -1;
+        if (!(lw_mods() & LW_SHIFT) || !sel_a) sel_a = press_pos;
+    }
+    if (sel_drag) {
+        const char *p = text_pos_at(x, y);
+        if (p && p != sel_b) { sel_b = p; dirty = 1; }
+        if (kind == LW_UP && button == 0) { sel_drag = 0; press_down = 0; }
+        return LW_CURSOR_TEXT;
+    }
     int ci = item_at(x, y, IT_CONTROL);
     int li = ci < 0 ? item_at(x, y, IT_TEXT) : -1;
     int link = li >= 0 ? items[li].link : -1;
@@ -2989,6 +3178,28 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
         if (button == 0 && ctl >= 0) activate_control(ctl);
         else if (button == 0 && focus >= 0) { focus = -1; dirty = 1; }
     }
+    if (kind == LW_DOWN && button == 0 && ctl < 0) {
+        double now = lw_now();
+        int near = (x - press_x) * (x - press_x) + (y - press_y) * (y - press_y) <= 25;
+        press_count = now - last_press_t < 500 && near ? press_count % 3 + 1 : 1;
+        last_press_t = now;
+        press_down = 1;
+        press_x = x;
+        press_y = y;
+        press_pos = text_pos_at(x, y);
+        if ((lw_mods() & LW_SHIFT) && sel_a) {  // Shift+click: extend the selection to here
+            sel_b = press_pos;
+            sel_drag = 1;
+            pressed_link = -1;
+            dirty = 1;
+        } else if (press_count > 1 && link < 0) {
+            select_around(press_pos, press_count);
+        } else if (sel_a) {
+            sel_a = sel_b = 0;  // a click clears the selection
+            dirty = 1;
+        }
+    }
+    if (kind == LW_UP && button == 0) press_down = 0;
     if (kind == LW_UP && (button == 0 || button == 1)) {
         if (link >= 0 && link == pressed_link && link < nlinks) {
             const char *target = links[link].target;
@@ -3001,12 +3212,43 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
         int kk = controls[ctl].kind;
         return kk == K_TEXT || kk == K_PASSWORD || kk == K_TEXTAREA ? LW_CURSOR_TEXT : LW_CURSOR_HAND;
     }
-    return link >= 0 ? LW_CURSOR_HAND : LW_CURSOR_ARROW;
+    if (link >= 0) return LW_CURSOR_HAND;
+    int ti = -1;  // over text: the text cursor, as browsers show
+    for (int i = draw_limit - 1, dy = y + scroll_y; i >= 0 && ti < 0; i--)
+        if (items[i].kind == IT_TEXT && x >= items[i].x && x < items[i].x + items[i].w && dy >= items[i].y && dy < items[i].y + items[i].h) ti = i;
+    return ti >= 0 ? LW_CURSOR_TEXT : LW_CURSOR_ARROW;
+}
+
+// Pastes the clipboard into the focused text field (at the end, or over a Ctrl+A selection).
+static void paste_into_field(Control *k) {
+    char buf[4096];
+    int n = lw_clipboard_get(buf, (int)sizeof buf);
+    if (n <= 0) return;
+    if (n > (int)sizeof buf) n = (int)sizeof buf;
+    while (n > 0 && (buf[n - 1] & 0xC0) == 0x80) n--;  // a character cut off at the end
+    if (n > 0 && (u8)buf[n - 1] >= 0xC0) n--;
+    char v[4096];
+    int base = focus_all ? 0 : k->vlen, m = base;
+    __builtin_memcpy(v, k->value, (u32)base);
+    for (int i = 0; i < n && m < 4000; i++) {
+        u8 c = (u8)buf[i];
+        if (c == '\r') continue;
+        v[m++] = c < 32 ? ' ' : (char)c;  // fields here are one line: newlines and tabs become spaces
+    }
+    while (m > 0 && (v[m - 1] & 0xC0) == 0x80 && m >= 4000) m--;
+    set_value(k, v, m);
+    focus_all = 0;
+    caret_t = lw_now();
+    dirty = 1;
 }
 
 LW_EXPORT(lw_char) void lw_char(int cp) {
     if (focus < 0) return;
     Control *k = &controls[focus];
+    if (focus_all) {  // typing replaces what Ctrl+A selected
+        k->vlen = 0;
+        focus_all = 0;
+    }
     u8 buf[4];
     int n = utf8_put(buf, (u32)cp);
     if (k->vlen + n > 4000) return;
@@ -3021,8 +3263,31 @@ LW_EXPORT(lw_char) void lw_char(int cp) {
 LW_EXPORT(lw_key) int lw_key(int key, int mods, int down) {
     if (!down) return 0;
     restore_y = -1;  // the reader took over
+    int ctrl = mods & LW_CTRL, shift = mods & LW_SHIFT;
+    int copy = (ctrl && key == 'C') || (ctrl && key == LW_KEY_INSERT), paste = (ctrl && key == 'V') || (shift && key == LW_KEY_INSERT);
+    int cut = ctrl && key == 'X';
     if (focus >= 0) {
         Control *k = &controls[focus];
+        int secret = k->kind == K_PASSWORD;
+        if (ctrl && key == 'A') { focus_all = k->vlen > 0; dirty = 1; return 1; }
+        if (paste) { paste_into_field(k); return 1; }
+        if (copy || cut) {  // the field's text, if Ctrl+A selected it (never a password's)
+            if (focus_all && !secret) {
+                lw_clipboard_set(k->value, k->vlen);
+                if (cut) { k->vlen = 0; focus_all = 0; dirty = 1; }
+            }
+            return 1;
+        }
+        if (key == LW_KEY_BACKSPACE && focus_all) {
+            k->vlen = 0;
+            focus_all = 0;
+            dirty = 1;
+            return 1;
+        }
+        if (focus_all && (key == LW_KEY_LEFT || key == LW_KEY_RIGHT || key == LW_KEY_HOME || key == LW_KEY_END)) {
+            focus_all = 0;
+            dirty = 1;
+        }
         if (key == LW_KEY_BACKSPACE) {
             if (k->vlen) {
                 int n = k->vlen - 1;
@@ -3042,7 +3307,9 @@ LW_EXPORT(lw_key) int lw_key(int key, int mods, int down) {
         if (key == LW_KEY_ESCAPE || key == LW_KEY_TAB) { focus = -1; dirty = 1; return 1; }
         if (key != LW_KEY_UP && key != LW_KEY_DOWN && key != LW_KEY_PAGEUP && key != LW_KEY_PAGEDOWN) return 1;
     }
-    (void)mods;
+    if (ctrl && key == 'A') { select_all_text(); return 1; }
+    if (copy) { copy_selection(); return 1; }
+    if (key == LW_KEY_ESCAPE && sel_a) { sel_a = sel_b = 0; dirty = 1; return 1; }
     int line = (int)(40 * S), pageh = H - (int)(60 * S);
     switch (key) {
     case LW_KEY_DOWN: scroll_to(target_y + line); return 1;
@@ -3424,6 +3691,14 @@ LW_EXPORT(lw_frame) void lw_frame(double now) {
     }
     check_anchor();
     check_restore();
+    if (sel_drag && (drag_y < 0 || drag_y >= H)) {  // dragging a selection past the edge scrolls
+        int step = (drag_y < 0 ? drag_y : drag_y - H + 1) / 2;
+        step = step < 0 ? MIN(step, -(int)(4 * S)) : MAX(step, (int)(4 * S));
+        scroll_y = target_y = clamp_scroll(scroll_y + step);
+        const char *p = text_pos_at(drag_x, drag_y < 0 ? 0 : H - 1);
+        if (p) sel_b = p;
+        dirty = 1;
+    }
     if (dirty) last_progress_draw = now;
     if (scroll_y != target_y) {
         int d = target_y - scroll_y;

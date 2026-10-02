@@ -80,6 +80,16 @@ bin\lowweb.exe https://th.wikipedia.org/wiki/ภาษาไทย   :: เว�
 
 ลากไฟล์ `.wasm` มาวางเพื่อรัน · ลากรูปมาวางบน Paint เพื่อเปิดรูป
 
+**เลือก คัดลอก วางข้อความ**: ลากเมาส์เพื่อเลือก, ดับเบิลคลิก = คำ, คลิกสามครั้ง = ทั้งย่อหน้า, `Shift`+คลิก = ขยายส่วนที่เลือก,
+`Ctrl+A` เลือกทั้งหน้า, `Ctrl+C` คัดลอก (ขึ้นบรรทัดใหม่ตามหน้า), ลากเลยขอบบน/ล่างแล้วหน้าเลื่อนตาม; ในช่องกรอก `Ctrl+V` วาง,
+`Ctrl+A` แล้ว `Ctrl+C`/`Ctrl+X` คัดลอก/ตัด (ช่องรหัสผ่านคัดลอกไม่ได้); หน้าที่ browser แสดงเอง (ไฟล์ข้อความ, หน้า error) ก็เลือกและคัดลอกได้
+หน้า Low-web ใช้ clipboard ผ่าน `lw_clipboard_set`/`lw_clipboard_get`: เขียนได้เฉพาะตอนจัดการ input ของผู้ใช้
+และอ่านได้เฉพาะตอนผู้ใช้กด `Ctrl+V`/`Shift+Insert` เท่านั้น หน้าเว็บจึงแอบอ่านหรือเขียนทับ clipboard ไม่ได้
+
+**แถบแท็บคือ title bar**: หน้าต่างไม่มี title bar ของ Windows แล้ว แถบแท็บอยู่บนสุดแทนแบบ browser ทั่วไป
+มีปุ่มย่อ/ขยาย/ปิดของตัวเองทางขวา, ลากที่ว่างบนแถบเพื่อย้ายหน้าต่าง, ดับเบิลคลิกที่ว่างเพื่อขยายเต็มจอ, คลิกขวาที่ว่างได้เมนูของหน้าต่าง,
+ลากขอบบนเพื่อปรับขนาด; Aero Snap และ `Win+←/→/↑` ใช้ได้ตามปกติ
+
 **ค้นหาจากช่อง address**: ถ้าสิ่งที่พิมพ์ไม่ใช่ address (มีช่องว่าง, ไม่มีจุด, ขึ้นต้นด้วย `?`) จะค้นหาแทน
 ปุ่มเล็กข้างช่อง address ใช้เลือก search engine: **DuckDuckGo** (ค่าเริ่มต้น), **Google**, **Bing**
 ค่าที่เลือกเก็บไว้ที่ `%APPDATA%\Low-web\settings.ini`
@@ -183,7 +193,7 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 | `lw_start`, `lw_resize`, `lw_frame` | `lw_present` ส่งภาพขึ้นจอ |
 | `lw_pointer` (เมาส์ → คืน cursor) | `lw_text`, `lw_text_width` (ตัวหนา/เอียง/monospace), `lw_line_breaks` |
 | `lw_key`, `lw_char` | `lw_fetch` → ผลกลับมาทาง `lw_on_fetch` / `lw_on_fetch_ex` |
-| `lw_alloc` (ให้ browser ขอหน่วยความจำ) | `lw_open_file` → `lw_on_file`, `lw_save_file` |
+| `lw_alloc` (ให้ browser ขอหน่วยความจำ) | `lw_open_file` → `lw_on_file`, `lw_save_file`, `lw_clipboard_set/get` |
 | `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (เอกสารแบบ stream), `lw_state`/`lw_restore` (ตำแหน่งที่อ่านอยู่, ไม่บังคับ) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
 
 ## Host จริง
@@ -205,7 +215,8 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 
 | คำสั่ง | ทดสอบอะไร |
 |---|---|
-| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/check_select.py` | เลือก/คัดลอก/วางข้อความ: ทั้งหน้า, ลากเลือก (ข้ามลิงก์), ช่องกรอก (วาง, ตัด, รหัสผ่านคัดลอกไม่ได้), ไฟล์ข้อความ, หน้า error; แถบแท็บ: ส่วนไหนเป็น caption/ปุ่ม/ขอบปรับขนาด, ปุ่มขยายหน้าต่าง |
 | `python tests/check_sleep.py` | แท็บหลับแล้วตื่นมาเหมือนเดิมทุก pixel ที่ตำแหน่งเดิม, back และ reload กลับที่เดิม, หน้าที่พิมพ์ไว้และหน้า Low-web ไม่หลับ |
 | `python tests/check_access.py` | หน้าเว็บเข้าถึงอะไรได้: ระดับของ IP, หน้าเว็บจากอินเทอร์เน็ต/วงแลนเข้า 127.0.0.1, `localhost`, `[::1]` ไม่ได้, redirect ไป `file://`, ของใน cache, ไฟล์นอกโฟลเดอร์ (`..`, `%2e%2e`, `%5c`) |
 | `bash tests/check_lowd.sh [LOWD]` | `lowd`: ส่ง `index.wasm`, redirect โฟลเดอร์, 404, กัน `..`/`%2e%2e`, ปฏิเสธ POST, HEAD |
@@ -222,7 +233,7 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 | `python tests/gen_hpack_huffman.py` | สร้าง `browser/hpack_huffman.h` (ตาราง Huffman ของ HPACK จาก RFC 7541) |
 | `python tests/gen_webp_tables.py` | สร้าง `browser/webp_tables.h` (ตารางค่าคงที่ของ VP8/VP8L จาก spec) |
 | `bin\fetchtest [--exact] [--cache DIR] URL…` | HTTP/HTTPS, redirect, chunked, gzip, ตรวจ certificate, กฎ `index.wasm`; log บอกว่าแต่ละ request มาจาก cache หรือใช้ connection เดิม |
-| `bin\lowweb.exe URL --size 1000x680 --log out.log --script "wait 500; click 100 200; key 83 ctrl" --screenshot out.bmp` | ขับ browser อัตโนมัติแล้วถ่ายภาพหน้าจอ (log บอกเวลานับจากเริ่มโหลด เช่น `[page +383 ms] viewer: first screen…`; คำสั่งรอจะรอให้โหลดเสร็จก่อน ยกเว้นสั่ง `async`; `mem` เขียนการใช้หน่วยความจำลง log) |
+| `bin\lowweb.exe URL --size 1000x680 --log out.log --script "wait 500; click 100 200; key 83 ctrl" --screenshot out.bmp` | ขับ browser อัตโนมัติแล้วถ่ายภาพหน้าจอ (log บอกเวลานับจากเริ่มโหลด เช่น `[page +383 ms] viewer: first screen…`; คำสั่งรอจะรอให้โหลดเสร็จก่อน ยกเว้นสั่ง `async`; `mem` เขียนการใช้หน่วยความจำลง log; `clip TEXT` ใส่ข้อความใน clipboard ของ script (script mode ไม่แตะ clipboard จริง: ทุกการคัดลอกเขียนเป็น `[clipboard] …` ใน log); `hittest X Y` บอกว่าจุดนั้นบนแถบแท็บเป็นอะไร) |
 
 ## ข้อจำกัดที่รู้อยู่
 

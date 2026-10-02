@@ -84,6 +84,7 @@ TESTS = [
     ('hpack', script('tests/check_hpack.py', 'tests/samples/rfc7541.txt')),
     ('access', script('tests/check_access.py')),
     ('sleep', script('tests/check_sleep.py')),
+    ('select', script('tests/check_select.py')),
 ]
 
 only = sys.argv[1:]

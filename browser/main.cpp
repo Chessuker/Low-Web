@@ -99,7 +99,8 @@ const COLORREF kAccent = RGB(14, 165, 233);
 
 HINSTANCE g_inst;
 HWND g_main, g_view, g_url, g_btn[4], g_engine_btn;
-HFONT g_ui_font, g_doc_font, g_doc_bold, g_mono_font, g_tab_font;
+HFONT g_ui_font, g_doc_font, g_doc_bold, g_mono_font, g_tab_font, g_icon_font;
+bool g_window_active = true;  // the strip (our title bar) is paler while another window is active
 int g_dpi = 96;
 WNDPROC g_url_proc;
 
@@ -371,10 +372,22 @@ void unpack_frame(Frame &f) {
     std::vector<uint8_t>().swap(f.packed);
 }
 
+struct DocLine {
+    int start, len;  // in Doc::text
+    int x, y, h;     // y from the top of the document
+    bool heading;
+};
+
 struct Doc {
     std::wstring heading, body;
     bool mono = false, error = false;
     int scroll = 0;
+    // laid out by doc_layout() for a view width
+    std::wstring text;  // heading, a blank line, body: what the selection indexes
+    std::vector<DocLine> lines;
+    int laid_w = -1, height = 0;
+    int sel_a = 0, sel_b = 0;  // selected: text[min..max) (sel_a where it started)
+    bool selecting = false;
 };
 
 struct Tab;
@@ -532,7 +545,11 @@ void set_url_bar(const std::string &u) { SetWindowTextW(g_url, display_url(u).c_
 
 void show_doc(Tab &t, const std::wstring &heading, const std::wstring &body, bool error, bool mono = false) {
     t.frame = Frame();
-    t.doc = Doc{heading, body, mono, error, 0};
+    t.doc = Doc();
+    t.doc.heading = heading;
+    t.doc.body = body;
+    t.doc.mono = mono;
+    t.doc.error = error;
     if (is_active(&t)) InvalidateRect(g_view, nullptr, FALSE);
 }
 
@@ -569,6 +586,64 @@ bool page_call(Tab &t, int f, std::initializer_list<uint64_t> args, uint64_t *re
     }
     if (result) *result = res[0];
     return true;
+}
+
+// ---- the clipboard -----------------------------------------------------------------------
+
+std::wstring g_script_clipboard;  // script mode (tests) has a clipboard of its own: the user's stays untouched
+bool g_user_input = false;        // a page is handling the user's key, click or typing: it may copy
+bool g_paste_key = false;         // ... and that key is Ctrl+V or Shift+Insert: it may read the clipboard
+
+struct UserInput {  // marks a page call as the user's doing for its duration
+    bool old_input, old_paste;
+    explicit UserInput(bool paste = false) : old_input(g_user_input), old_paste(g_paste_key) {
+        g_user_input = true;
+        g_paste_key = paste;
+    }
+    ~UserInput() {
+        g_user_input = old_input;
+        g_paste_key = old_paste;
+    }
+};
+
+void clipboard_set(const std::wstring &text) {
+    if (g_script_mode) {
+        g_script_clipboard = text;
+        std::string shown;
+        for (char c : narrow(text)) shown += c == '\n' ? std::string("\\n") : std::string(1, c);
+        log_line("[clipboard] " + shown);
+        return;
+    }
+    std::wstring t;  // Windows text: CR LF line ends
+    for (wchar_t c : text) {
+        if (c == L'\n' && (t.empty() || t.back() != L'\r')) t += L'\r';
+        t += c;
+    }
+    if (!OpenClipboard(g_main)) return;
+    EmptyClipboard();
+    if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (t.size() + 1) * sizeof(wchar_t))) {
+        std::memcpy(GlobalLock(h), t.c_str(), (t.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(h);
+        if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+    }
+    CloseClipboard();
+}
+
+std::wstring clipboard_get() {
+    std::wstring t;
+    if (g_script_mode) {
+        t = g_script_clipboard;
+    } else if (OpenClipboard(g_main)) {
+        if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+            if (const wchar_t *p = (const wchar_t *)GlobalLock(h)) {
+                t = p;
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+    }
+    t.erase(std::remove(t.begin(), t.end(), L'\r'), t.end());
+    return t;
 }
 
 // Where the reader is in the tab's page (lw_state), to give back when it is loaded again; 0 = nothing.
@@ -780,6 +855,21 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
         std::vector<uint8_t> tmp(in.memory() + p, in.memory() + p + n), flags(n);
         line_breaks(tmp.data(), (int)n, flags.data());
         std::memcpy(in.memory() + out, flags.data(), n);
+    });
+    add("clipboard_set", "ii:", [](Instance &in, uint64_t *a) {
+        std::string text = mem_str(in, a[0], a[1]);
+        if (g_user_input) clipboard_set(widen(text));
+    });
+    add("clipboard_get", "ii:i", [](Instance &in, uint64_t *a) {
+        uint32_t p = (uint32_t)a[0], cap = (uint32_t)a[1];
+        a[0] = (uint32_t)-1;
+        if (!g_paste_key) return;  // only for the user's paste key
+        std::string text = narrow(clipboard_get());
+        if (text.empty()) return;
+        uint32_t n = (uint32_t)std::min<size_t>(text.size(), cap);
+        if (!in.in_memory(p, n)) throw wasm::Trap{"lw_clipboard_get: buffer outside memory"};
+        std::memcpy(in.memory() + p, text.data(), n);
+        a[0] = (uint32_t)std::min<size_t>(text.size(), 0x7FFFFFFF);
     });
     add("text_width", "iiii:i", [](Instance &in, uint64_t *a) {
         std::string s = mem_str(in, a[0], a[1]);
@@ -1288,7 +1378,103 @@ RECT frame_rect(const Frame &f) {
     return d;
 }
 
+// The tab shows a document of the browser's own (an error, plain text), not a page.
+bool showing_doc(const Tab &t) { return !t.frame.w && !(t.page && !t.page->crashed); }
+
+// Lays the document out in lines for a view `vw` wide (once per width): the heading, then
+// the body, each paragraph wrapped at spaces. Kept so that the mouse can select text.
+void doc_layout(Doc &doc, int vw) {
+    if (doc.laid_w == vw) return;
+    doc.laid_w = vw;
+    doc.lines.clear();
+    std::wstring body;  // tabs as spaces (to the next multiple of 8, or 4)
+    int col = 0, tab = doc.mono ? 8 : 4;
+    for (wchar_t c : doc.body) {
+        if (c == L'\t') {
+            do { body += L' '; } while (++col % tab);
+        } else {
+            body += c;
+            col = c == L'\n' ? 0 : col + 1;
+        }
+    }
+    doc.text = doc.heading.empty() ? body : doc.heading + L"\n\n" + body;
+    int margin = S(40), maxw = std::min<int>(vw - 2 * margin, S(820));
+    int x = std::max<int>(margin, (vw - maxw) / 2), y = S(36);
+    if (doc.mono) { x = S(24); maxw = vw - S(48); y = S(20); }
+    maxw = std::max(maxw, S(40));
+    HDC dc = GetDC(g_view);
+    auto flow = [&](int from, int to, HFONT f, bool heading) {
+        SelectObject(dc, f);
+        TEXTMETRICW tm;
+        GetTextMetricsW(dc, &tm);
+        const wchar_t *s = doc.text.c_str();
+        int p = from;
+        for (;;) {
+            int e = p;
+            while (e < to && s[e] != L'\n') e++;
+            int q = p;
+            do {  // the paragraph p..e, wrapped
+                int n = e - q, fit = n;
+                SIZE sz;
+                GetTextExtentExPointW(dc, s + q, n, maxw, &fit, nullptr, &sz);
+                int take = n;
+                if (fit < n) {
+                    int brk = fit;
+                    while (brk > 0 && s[q + brk] != L' ') brk--;
+                    take = brk > 0 ? brk + 1 : std::max(fit, 1);
+                }
+                doc.lines.push_back({q, take, x, y, (int)tm.tmHeight, heading});
+                y += tm.tmHeight;
+                q += take;
+            } while (q < e);
+            if (e >= to) break;
+            p = e + 1;
+        }
+    };
+    if (!doc.heading.empty()) {
+        flow(0, (int)doc.heading.size(), g_doc_bold, true);
+        y += S(16);
+        flow((int)doc.heading.size() + 2, (int)doc.text.size(), doc.mono ? g_mono_font : g_doc_font, false);
+    } else {
+        flow(0, (int)doc.text.size(), doc.mono ? g_mono_font : g_doc_font, false);
+    }
+    doc.height = y + S(40);
+    ReleaseDC(g_view, dc);
+}
+
+int line_x(HDC dc, const Doc &doc, const DocLine &l, int chars) {  // where character `chars` of the line starts
+    SIZE sz{0, 0};
+    if (chars > 0) GetTextExtentPoint32W(dc, doc.text.c_str() + l.start, chars, &sz);
+    return l.x + sz.cx;
+}
+
+// The text index nearest to view point (vx, vy).
+int doc_index_at(Doc &doc, int vx, int vy) {
+    RECT rc;
+    GetClientRect(g_view, &rc);
+    doc_layout(doc, rc.right);
+    if (doc.lines.empty()) return 0;
+    int y = vy + doc.scroll;
+    if (y < doc.lines.front().y) return doc.lines.front().start;
+    size_t li = 0;
+    while (li + 1 < doc.lines.size() && doc.lines[li + 1].y <= y) li++;
+    const DocLine &l = doc.lines[li];
+    if (li + 1 == doc.lines.size() && y >= l.y + l.h) return (int)doc.text.size();
+    HDC dc = GetDC(g_view);
+    SelectObject(dc, l.heading ? g_doc_bold : doc.mono ? g_mono_font : g_doc_font);
+    int best = 0, prev_x = l.x;
+    for (int k = 1; k <= l.len; k++) {  // the boundary closest to vx
+        int cx = line_x(dc, doc, l, k);
+        if (vx >= (prev_x + cx) / 2) best = k;
+        prev_x = cx;
+    }
+    ReleaseDC(g_view, dc);
+    if (best == l.len && best > 0 && doc.text[l.start + best - 1] == L' ' && li + 1 < doc.lines.size()) best--;  // not past a wrap
+    return l.start + best;
+}
+
 void paint_doc(HDC hdc, const RECT &rc, Doc &doc) {
+    doc_layout(doc, rc.right);
     HDC mem = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
     HGDIOBJ old = SelectObject(mem, bmp);
@@ -1296,50 +1482,41 @@ void paint_doc(HDC hdc, const RECT &rc, Doc &doc) {
     FillRect(mem, &rc, bg);
     DeleteObject(bg);
     SetBkMode(mem, TRANSPARENT);
-
-    int margin = S(40), maxw = std::min<int>(rc.right - 2 * margin, S(820));
-    int x = std::max<int>(margin, ((int)rc.right - maxw) / 2);
-    int y = S(36) - doc.scroll;
-    if (doc.mono) { x = S(24); maxw = rc.right - S(48); y = S(20) - doc.scroll; }
-    if (doc.error) {
+    if (doc.scroll > 0 && doc.height - doc.scroll < rc.bottom) doc.scroll = std::max(0, doc.height - (int)rc.bottom);
+    if (doc.error && !doc.lines.empty()) {
+        int y = doc.lines.front().y - doc.scroll, x = doc.lines.front().x;
         RECT bar{x - S(20), y + S(4), x - S(14), y + S(34)};
         HBRUSH b = CreateSolidBrush(RGB(220, 38, 38));
         FillRect(mem, &bar, b);
         DeleteObject(b);
     }
-    if (!doc.heading.empty()) {
-        SelectObject(mem, g_doc_bold);
-        SetTextColor(mem, RGB(17, 24, 39));
-        RECT hr{x, y, x + maxw, y + S(400)};
-        DrawTextW(mem, doc.heading.c_str(), -1, &hr, DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
-        DrawTextW(mem, doc.heading.c_str(), -1, &hr, DT_WORDBREAK | DT_NOPREFIX);
-        y = hr.bottom + S(16);
+    int s0 = std::min(doc.sel_a, doc.sel_b), s1 = std::max(doc.sel_a, doc.sel_b);
+    HBRUSH sel = CreateSolidBrush(RGB(179, 215, 255));
+    for (const DocLine &l : doc.lines) {
+        int y = l.y - doc.scroll;
+        if (y + l.h < 0 || y > rc.bottom) continue;
+        SelectObject(mem, l.heading ? g_doc_bold : doc.mono ? g_mono_font : g_doc_font);
+        int a = std::max(s0, l.start), b = std::min(s1, l.start + l.len);
+        if (a < b || (s1 > l.start + l.len && s0 <= l.start + l.len && a <= b)) {  // selected (to the line end: a bit more)
+            RECT r{line_x(mem, doc, l, a - l.start), y, line_x(mem, doc, l, b - l.start), y + l.h};
+            if (s1 > l.start + l.len) r.right += S(6);
+            if (r.right > r.left) FillRect(mem, &r, sel);
+        }
+        SetTextColor(mem, l.heading ? RGB(17, 24, 39) : RGB(55, 65, 81));
+        TextOutW(mem, l.x, y, doc.text.c_str() + l.start, l.len);
     }
-    SelectObject(mem, doc.mono ? g_mono_font : g_doc_font);
-    SetTextColor(mem, RGB(55, 65, 81));
-    RECT br{x, y, x + maxw, y + 100000};
-    DrawTextW(mem, doc.body.c_str(), -1, &br, DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS | DT_CALCRECT);
-    int content_bottom = br.bottom + doc.scroll + S(40);
-    if (doc.scroll > 0 && content_bottom - doc.scroll < rc.bottom) doc.scroll = std::max(0, content_bottom - (int)rc.bottom);
-    DrawTextW(mem, doc.body.c_str(), -1, &br, DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS);
-
+    DeleteObject(sel);
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old);
     DeleteObject(bmp);
     DeleteDC(mem);
 }
 
-int doc_max_scroll(const Doc &doc) {
-    HDC dc = GetDC(g_view);
+int doc_max_scroll(Doc &doc) {
     RECT rc;
     GetClientRect(g_view, &rc);
-    SelectObject(dc, doc.mono ? g_mono_font : g_doc_font);
-    int maxw = doc.mono ? rc.right - S(48) : std::min<int>(rc.right - 2 * S(40), S(820));
-    RECT br{0, 0, maxw, 100000};
-    DrawTextW(dc, doc.body.c_str(), -1, &br, DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS | DT_CALCRECT);
-    ReleaseDC(g_view, dc);
-    int total = br.bottom + S(doc.heading.empty() ? 60 : 110);
-    return std::max(0, total - (int)rc.bottom);
+    doc_layout(doc, rc.right);
+    return std::max(0, doc.height - (int)rc.bottom);
 }
 
 void scroll_doc(int dy) {
@@ -1413,6 +1590,7 @@ void pointer_event(int kind, int vx, int vy, int button) {
     float fx = (float)((vx + 0.5 - d.left) * t.frame.w / std::max<LONG>(1, d.right - d.left));
     float fy = (float)((vy + 0.5 - d.top) * t.frame.h / std::max<LONG>(1, d.bottom - d.top));
     uint64_t cur = 0;
+    UserInput user(false);
     if (page_call(t, t.page->f_pointer, {(uint32_t)kind, wasm::from_f32(fx), wasm::from_f32(fy), (uint32_t)button}, &cur)) {
         if (t.page) t.page->cursor = (int)cur;
         if (kind != 3) set_cursor_kind((int)cur);
@@ -1464,7 +1642,7 @@ LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND: return 1;
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            set_cursor_kind(t.page && t.frame.w && !t.page->crashed ? t.page->cursor : 0);
+            set_cursor_kind(t.page && t.frame.w && !t.page->crashed ? t.page->cursor : showing_doc(t) ? 4 : 0);
             return TRUE;
         }
         break;
@@ -1474,23 +1652,54 @@ LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             TrackMouseEvent(&tme);
             tracking = true;
         }
+        if (showing_doc(t) && t.doc.selecting) {
+            int at = doc_index_at(t.doc, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            if (at != t.doc.sel_b) {
+                t.doc.sel_b = at;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            RECT rc;
+            GetClientRect(hwnd, &rc);  // past the top or bottom: scroll along
+            int y = GET_Y_LPARAM(lp);
+            if (y < 0 || y >= rc.bottom) scroll_doc(y < 0 ? y : y - rc.bottom + 1);
+            return 0;
+        }
         pointer_event(1, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0);
         return 0;
     case WM_MOUSELEAVE:
         tracking = false;
         pointer_event(3, -1, -1, 0);
         return 0;
-    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: {
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_LBUTTONDBLCLK: {
         SetFocus(hwnd);
         SetCapture(hwnd);
         buttons_down++;
-        int b = msg == WM_LBUTTONDOWN ? 0 : msg == WM_MBUTTONDOWN ? 1 : 2;
+        int b = msg == WM_RBUTTONDOWN ? 2 : msg == WM_MBUTTONDOWN ? 1 : 0;
+        if (showing_doc(t) && b == 0) {
+            int at = doc_index_at(t.doc, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            if (msg == WM_LBUTTONDBLCLK) {  // a word
+                const std::wstring &x = t.doc.text;
+                auto word = [&](int i) { return i >= 0 && i < (int)x.size() && (iswalnum(x[i]) || (x[i] >= 0x0E00 && x[i] <= 0x0E7F) || x[i] == L'_'); };
+                int a = at, e = at;
+                while (word(a - 1)) a--;
+                while (word(e)) e++;
+                t.doc.sel_a = a;
+                t.doc.sel_b = e;
+            } else {
+                if (!(current_mods() & 1)) t.doc.sel_a = at;
+                t.doc.sel_b = at;
+                t.doc.selecting = true;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         pointer_event(0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), b);
         return 0;
     }
     case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: {
         int b = msg == WM_LBUTTONUP ? 0 : msg == WM_MBUTTONUP ? 1 : 2;
         if (--buttons_down <= 0) { buttons_down = 0; ReleaseCapture(); }
+        t.doc.selecting = false;
         pointer_event(2, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), b);
         return 0;
     }
@@ -1511,11 +1720,24 @@ LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (browser_key(wp, mods)) return 0;
         Tab &a = T();  // browser_key may have switched tabs
         if (a.page && a.page->f_key >= 0 && !a.page->crashed) {
+            UserInput user(((mods & 2) && wp == 'V') || ((mods & 1) && wp == VK_INSERT));
             page_call(a, a.page->f_key, {(uint32_t)wp, (uint32_t)mods, 1u});
             if (msg == WM_KEYDOWN) return 0;
         } else if (!a.frame.w) {
             RECT rc;
             GetClientRect(hwnd, &rc);
+            Doc &doc = a.doc;
+            if ((mods & 2) && wp == 'A') {
+                doc.sel_a = 0;
+                doc.sel_b = (int)doc.text.size();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if ((mods & 2) && (wp == 'C' || wp == VK_INSERT)) {
+                int s0 = std::min(doc.sel_a, doc.sel_b), s1 = std::max(doc.sel_a, doc.sel_b);
+                if (s1 > s0 && s1 <= (int)doc.text.size()) clipboard_set(doc.text.substr(s0, s1 - s0));
+                return 0;
+            }
             switch (wp) {
             case VK_DOWN: scroll_doc(S(40)); return 0;
             case VK_UP: scroll_doc(-S(40)); return 0;
@@ -1529,7 +1751,10 @@ LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        if (t.page && t.page->f_key >= 0) page_call(t, t.page->f_key, {(uint32_t)wp, (uint32_t)current_mods(), 0u});
+        if (t.page && t.page->f_key >= 0) {
+            UserInput user;
+            page_call(t, t.page->f_key, {(uint32_t)wp, (uint32_t)current_mods(), 0u});
+        }
         break;
     case WM_CHAR: {
         wchar_t c = (wchar_t)wp;
@@ -1539,6 +1764,7 @@ LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         high_surrogate = 0;
         if (cp >= 32 && cp != 127 && t.page && t.page->f_char >= 0) {
             t.page->typed = true;
+            UserInput user;
             page_call(t, t.page->f_char, {cp});
         }
         return 0;
@@ -1585,12 +1811,44 @@ struct TabGeom {
     RECT tab, close;
 };
 
+// The strip is the window's title bar as well (as in other browsers): the window has no
+// caption of its own (WM_NCCALCSIZE), the strip's empty parts move it (WM_NCHITTEST:
+// HTCAPTION, so double-click maximizes and right-click shows the system menu), and its
+// right end has the minimize, maximize/restore and close buttons, drawn here.
+enum { CAP_MIN, CAP_MAX, CAP_CLOSE };
+int g_cap_hover = -1, g_cap_pressed = -1;
+
+RECT caption_rect(int which) {
+    RECT rc;
+    GetClientRect(g_main, &rc);
+    int w = S(46), x = rc.right - (3 - which) * w;
+    return RECT{x, 0, x + w, tabstrip_height()};
+}
+
+int caption_hit(int x, int y) {
+    POINT pt{x, y};
+    for (int i = 0; i < 3; i++) {
+        RECT r = caption_rect(i);
+        if (PtInRect(&r, pt)) return i;
+    }
+    return -1;
+}
+
+// The frame Windows would have above the client area (where a maximized window's edge
+// hangs off the screen).
+int frame_thickness() {
+    using ForDpi = int(WINAPI *)(int, UINT);
+    static auto f = (ForDpi)(void *)GetProcAddress(GetModuleHandleW(L"user32"), "GetSystemMetricsForDpi");
+    if (f) return f(SM_CYFRAME, (UINT)g_dpi) + f(SM_CXPADDEDBORDER, (UINT)g_dpi);
+    return GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+}
+
 std::vector<TabGeom> tab_geometry(RECT &plus) {
     RECT rc;
     GetClientRect(g_main, &rc);
     int n = (int)g_tabs.size();
     int left = S(8), top = S(6), h = tabstrip_height() - top;
-    int avail = rc.right - left - S(48);
+    int avail = rc.right - left - S(48) - 3 * S(46) - S(40);  // room for "+", the window buttons and a place to drag
     int w = n ? std::clamp(avail / n, S(48), S(230)) : S(230);
     std::vector<TabGeom> g(n);
     for (int i = 0; i < n; i++) {
@@ -1620,7 +1878,7 @@ void paint_tabstrip(HDC hdc) {
     HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, H);
     HGDIOBJ old_bmp = SelectObject(mem, bmp);
     RECT all{0, 0, rc.right, H};
-    HBRUSH strip = CreateSolidBrush(RGB(222, 225, 230));
+    HBRUSH strip = CreateSolidBrush(g_window_active ? RGB(222, 225, 230) : RGB(234, 236, 239));
     FillRect(mem, &all, strip);
     DeleteObject(strip);
     SetBkMode(mem, TRANSPARENT);
@@ -1676,6 +1934,20 @@ void paint_tabstrip(HDC hdc) {
     }
     SetTextColor(mem, RGB(60, 64, 67));
     DrawTextW(mem, L"+", -1, &plus, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+    SelectObject(mem, g_icon_font);
+    for (int i = 0; i < 3; i++) {  // the window buttons
+        RECT r = caption_rect(i);
+        bool hot = i == g_cap_hover && (g_cap_pressed < 0 || g_cap_pressed == i), down = hot && g_cap_pressed == i;
+        if (hot) {
+            HBRUSH hb = CreateSolidBrush(i == CAP_CLOSE ? (down ? RGB(241, 112, 122) : RGB(232, 17, 35))
+                                                        : (down ? RGB(192, 195, 200) : RGB(208, 211, 216)));
+            FillRect(mem, &r, hb);
+            DeleteObject(hb);
+        }
+        SetTextColor(mem, i == CAP_CLOSE && hot ? RGB(255, 255, 255) : g_window_active ? RGB(32, 33, 36) : RGB(128, 132, 137));
+        const wchar_t *glyph = i == CAP_MIN ? L"\uE921" : i == CAP_MAX ? (IsZoomed(g_main) ? L"\uE923" : L"\uE922") : L"\uE8BB";
+        DrawTextW(mem, glyph, -1, &r, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+    }
     SelectObject(mem, old_pen);
     DeleteObject(sep);
     DeleteObject(active_b);
@@ -1684,6 +1956,22 @@ void paint_tabstrip(HDC hdc) {
     SelectObject(mem, old_bmp);
     DeleteObject(bmp);
     DeleteDC(mem);
+}
+
+int tabstrip_hit(int x, int y, bool *on_close, bool *on_plus);
+
+// What a point of the main window's client area is to Windows: the top edge resizes, the
+// strip's empty parts are the caption, the rest (tabs, buttons, toolbar) is ours.
+LRESULT strip_hit_test(int x, int y) {
+    if (!IsZoomed(g_main) && y < S(4)) {
+        RECT rc;
+        GetClientRect(g_main, &rc);
+        return x < S(16) ? HTTOPLEFT : x >= rc.right - S(16) ? HTTOPRIGHT : HTTOP;
+    }
+    if (y >= tabstrip_height() || caption_hit(x, y) >= 0) return HTCLIENT;
+    bool on_close = false, on_plus = false;
+    if (tabstrip_hit(x, y, &on_close, &on_plus) >= 0 || on_plus) return HTCLIENT;
+    return HTCAPTION;
 }
 
 // Returns the tab index under (x, y), -1 for none; *on_close / *on_plus are set as well.
@@ -1751,7 +2039,7 @@ LRESULT CALLBACK url_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void make_fonts() {
-    for (HFONT f : {g_ui_font, g_doc_font, g_doc_bold, g_mono_font, g_tab_font})
+    for (HFONT f : {g_ui_font, g_doc_font, g_doc_bold, g_mono_font, g_tab_font, g_icon_font})
         if (f) DeleteObject(f);
     auto mk = [](int pt, int weight, const wchar_t *face) {
         return CreateFontW(-MulDiv(pt, g_dpi, 72), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
@@ -1762,6 +2050,8 @@ void make_fonts() {
     g_doc_bold = mk(20, FW_SEMIBOLD, L"Segoe UI");
     g_mono_font = mk(10, FW_NORMAL, L"Consolas");
     g_tab_font = mk(9, FW_NORMAL, L"Segoe UI");
+    g_icon_font = CreateFontW(-S(10), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                              CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");  // the window buttons' glyphs
     for (HWND h : {g_url, g_btn[0], g_btn[1], g_btn[2], g_btn[3], g_engine_btn})
         if (h) SendMessageW(h, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
 }
@@ -2038,6 +2328,15 @@ void script_step() {
         else log_line("[script] cannot read " + path);
     } else if (o == "shot") { sscanf(cmd.c_str(), " %*s %511s", s1); save_screenshot(s1); }
     else if (o == "mem") log_memory();
+    else if (o == "hittest") {  // hittest X Y: what Windows is told about that point of the main window
+        sscanf(cmd.c_str(), " %*s %d %d", &a, &b);
+        POINT pt{a, b};
+        ClientToScreen(g_main, &pt);
+        log_line("[hittest] " + std::to_string(a) + " " + std::to_string(b) + " -> " +
+                 std::to_string(SendMessageW(g_main, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y))) +
+                 (IsZoomed(g_main) ? " (maximized)" : ""));
+    }
+    else if (o == "clip") g_script_clipboard = widen(cmd.size() > cmd.find("clip") + 5 ? cmd.substr(cmd.find("clip") + 5) : "");
     else log_line("[script] unknown command: " + cmd);
 }
 
@@ -2078,8 +2377,47 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_ERASEBKGND: return 1;
+    case WM_NCCALCSIZE:
+        if (wp) {  // no caption: the client area goes up to the top (the side and bottom borders stay)
+            auto *p = (NCCALCSIZE_PARAMS *)lp;
+            LONG top = p->rgrc[0].top;
+            LRESULT r = DefWindowProcW(hwnd, msg, wp, lp);
+            p->rgrc[0].top = top + (IsZoomed(hwnd) ? frame_thickness() : 0);  // maximized, the frame is off the screen
+            return r;
+        }
+        break;
+    case WM_NCHITTEST: {
+        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+        if (hit != HTCLIENT) return hit;  // the side and bottom borders
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &pt);
+        return strip_hit_test(pt.x, pt.y);
+    }
+    case WM_ACTIVATE:
+        g_window_active = LOWORD(wp) != WA_INACTIVE;
+        invalidate_tabs();
+        if (LOWORD(wp) != WA_INACTIVE && GetFocus() != g_url) SetFocus(g_view);
+        break;
+    case WM_LBUTTONUP:
+        if (g_cap_pressed >= 0) {
+            int which = g_cap_pressed;
+            g_cap_pressed = -1;
+            ReleaseCapture();
+            invalidate_tabs();
+            if (caption_hit(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)) == which) {
+                if (which == CAP_MIN) ShowWindow(hwnd, SW_MINIMIZE);
+                else if (which == CAP_MAX) ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+                else PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+        return 0;
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        int cap = caption_hit(x, y);
+        if (cap != g_cap_hover) {
+            g_cap_hover = cap;
+            invalidate_tabs();
+        }
         bool on_close = false, on_plus = false;
         int hit = y < tabstrip_height() ? tabstrip_hit(x, y, &on_close, &on_plus) : -1;
         int hc = on_close ? hit : -1;
@@ -2101,6 +2439,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSELEAVE:
         g_strip_tracking = false;
+        g_cap_hover = -1;
         g_tab_hover = g_tab_hover_close = -1;
         g_plus_hover = false;
         invalidate_tabs();
@@ -2108,11 +2447,20 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: case WM_MBUTTONUP: case WM_LBUTTONDBLCLK: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         if (y >= tabstrip_height()) break;
+        int cap = caption_hit(x, y);
+        if (cap >= 0) {
+            if (msg != WM_MBUTTONUP) {
+                g_cap_pressed = g_cap_hover = cap;
+                SetCapture(hwnd);
+                invalidate_tabs();
+            }
+            return 0;
+        }
         bool on_close = false, on_plus = false;
         g_tab_hover = -1;
         int hit = tabstrip_hit(x, y, &on_close, &on_plus);
         if (msg == WM_MBUTTONUP) { if (hit >= 0) close_tab(hit); return 0; }
-        if (on_plus || (msg == WM_LBUTTONDBLCLK && hit < 0)) { new_tab_command(); return 0; }
+        if (on_plus) { new_tab_command(); return 0; }
         if (hit >= 0) {
             if (on_close) close_tab(hit);
             else if (hit != g_active) activate_tab(hit);
@@ -2195,9 +2543,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         on_save_file(*req);
         return 0;
     }
-    case WM_ACTIVATE:
-        if (LOWORD(wp) != WA_INACTIVE && GetFocus() != g_url) SetFocus(g_view);
-        break;
+
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -2292,7 +2638,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof wc;
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wc.lpfnWndProc = view_proc;
     wc.hInstance = inst;
     wc.hCursor = nullptr;
@@ -2323,10 +2669,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
             make_fonts();
         }
     }
-    if (g_script_mode) {  // exact client size for reproducible screenshots
-        RECT want{0, 0, cw, ch + tabstrip_height() + toolbar_height()};
-        AdjustWindowRect(&want, WS_OVERLAPPEDWINDOW, FALSE);
-        SetWindowPos(hwnd, nullptr, 0, 0, want.right - want.left, want.bottom - want.top, SWP_NOMOVE | SWP_NOZORDER);
+    {  // the client size asked for (exact in script mode, for reproducible screenshots) plus the frame that is left
+        int want_w = g_script_mode ? cw : S(cw), want_h = (g_script_mode ? ch : S(ch)) + tabstrip_height() + toolbar_height();
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        RECT wr, cr;
+        GetWindowRect(hwnd, &wr);
+        GetClientRect(hwnd, &cr);
+        SetWindowPos(hwnd, nullptr, 0, 0, want_w + (wr.right - wr.left - cr.right), want_h + (wr.bottom - wr.top - cr.bottom),
+                     SWP_NOMOVE | SWP_NOZORDER);
     }
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);

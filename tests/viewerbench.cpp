@@ -106,6 +106,8 @@ int main(int argc, char **argv) {
     add("line_breaks", "iii:", [](Instance &in, uint64_t *a) {
         if (in.in_memory((uint32_t)a[2], (uint32_t)a[1])) std::memset(in.memory() + (uint32_t)a[2], 0, (size_t)a[1]);
     });
+    add("clipboard_set", "ii:", [](Instance &, uint64_t *) {});
+    add("clipboard_get", "ii:i", [](Instance &, uint64_t *a) { a[0] = (uint32_t)-1; });
     add("text_width", "iiii:i", [](Instance &in, uint64_t *a) {  // ~ average glyph width, per code point
         const uint8_t *s = in.memory() + (uint32_t)a[0];
         uint32_t n = (uint32_t)a[1], cps = 0;
