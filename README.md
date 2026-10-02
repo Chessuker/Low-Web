@@ -97,11 +97,21 @@ bin\lowweb.exe https://th.wikipedia.org/wiki/ภาษาไทย   :: เว�
   cookie ที่มีวันหมดอายุเก็บไว้ที่ `%LOCALAPPDATA%\Low-web\cookies.txt` ส่วน session cookie หายเมื่อปิด browser
 - **HTTP cache**: ทำตาม `Cache-Control` (`max-age`, `no-cache`, `no-store`), `Expires`, `ETag`/`If-None-Match`,
   `Last-Modified`/`If-Modified-Since` (ถ้า server ไม่บอกอายุ ใช้กฎ 10% ของ `Last-Modified` ไม่เกิน 1 วัน)
-  เก็บในหน่วยความจำ 48 MB และในดิสก์ที่ `%LOCALAPPDATA%\Low-web\Cache` ไม่เกิน 256 MB (ไฟล์ที่ไม่ได้ใช้นานที่สุดถูกลบก่อน)
+  เก็บในหน่วยความจำ 16 MB (ไฟล์ละไม่เกิน 2 MB) และในดิสก์ที่ `%LOCALAPPDATA%\Low-web\Cache` ไม่เกิน 256 MB (ไฟล์ที่ไม่ได้ใช้นานที่สุดถูกลบก่อน)
 - `F5` ถาม server ว่าหน้าเปลี่ยนไหม, `Ctrl+F5` / `Ctrl+Shift+R` โหลดใหม่ทั้งหมด, back/forward ใช้ของใน cache ถ้า server ไม่ได้สั่งให้ถามทุกครั้ง
-- `lowweb.exe --no-cache` ไม่ใช้ cache, `--cache-dir DIR` ใช้โฟลเดอร์อื่น, `--cookie-file FILE`, `--no-http2`;
+- `lowweb.exe --no-cache` ไม่ใช้ cache, `--cache-dir DIR` ใช้โฟลเดอร์อื่น, `--cookie-file FILE`, `--no-http2`, `--sleep-tabs-after SECONDS`;
   log (`--log`) มีบรรทัด `[net]` บอกทุก request ว่ามาจาก cache, connection เดิม/ใหม่, TLS แบบย่อ หรือ HTTP/2 stream ไหน
   (ตอนรันด้วย `--script` cookie อยู่ในหน่วยความจำเท่านั้น ไม่ปนกับของผู้ใช้)
+
+**หน่วยความจำ**
+- **แท็บที่ไม่ได้ดูนาน 10 นาทีจะ "หลับ"**: หน้าถูกปิดเพื่อคืนหน่วยความจำ (viewer บนหน้าใหญ่ใช้ 20–40 MB) เหลือแค่ภาพย่อที่บีบอัดไว้
+  พอกลับมาที่แท็บจะโหลดใหม่จาก cache และกลับไปที่ตำแหน่งเดิม; หลับเฉพาะหน้า HTML ที่โหลดด้วย GET และยังไม่ได้พิมพ์อะไรลงไป
+  (หน้า Low-web อย่าง Paint มี state ของตัวเอง จึงไม่หลับ); ตั้งเวลาได้ด้วย `--sleep-tabs-after SECONDS` (`0` = ไม่หลับเลย)
+- back/forward และ reload กลับไปที่ตำแหน่งเดิมในหน้า (ส่งผ่าน `lw_state`/`lw_restore` ใน `sdk/lowweb.h`)
+- ภาพของแท็บเบื้องหลังเก็บแบบบีบอัด (run-length: 3.2 MB → ~0.3 MB), viewer ทิ้ง HTML ส่วนที่ parse แล้วระหว่างดาวน์โหลด,
+  allocator ของ viewer แบ่ง/รวมก้อนที่ว่าง, cache ความกว้างข้อความเก็บเป็น hash
+- วัดได้ (working set): Wikipedia "United States" 54 → 49 MB, 4 แท็บ 142 → 124 MB และ 66 MB เมื่อ 3 แท็บเบื้องหลังหลับ;
+  script command `mem` เขียนลง log ว่าหน่วยความจำไปอยู่ที่ไหน (wasm ของแต่ละแท็บ, ภาพ, cache)
 
 **หน้าเว็บเข้าถึงอะไรได้บ้าง** (`net::Access` ใน `browser/net.h`)
 
@@ -174,7 +184,7 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 | `lw_pointer` (เมาส์ → คืน cursor) | `lw_text`, `lw_text_width` (ตัวหนา/เอียง/monospace), `lw_line_breaks` |
 | `lw_key`, `lw_char` | `lw_fetch` → ผลกลับมาทาง `lw_on_fetch` / `lw_on_fetch_ex` |
 | `lw_alloc` (ให้ browser ขอหน่วยความจำ) | `lw_open_file` → `lw_on_file`, `lw_save_file` |
-| `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (เอกสารแบบ stream) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
+| `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (เอกสารแบบ stream), `lw_state`/`lw_restore` (ตำแหน่งที่อ่านอยู่, ไม่บังคับ) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
 
 ## Host จริง
 
@@ -195,7 +205,8 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 
 | คำสั่ง | ทดสอบอะไร |
 |---|---|
-| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/check_sleep.py` | แท็บหลับแล้วตื่นมาเหมือนเดิมทุก pixel ที่ตำแหน่งเดิม, back และ reload กลับที่เดิม, หน้าที่พิมพ์ไว้และหน้า Low-web ไม่หลับ |
 | `python tests/check_access.py` | หน้าเว็บเข้าถึงอะไรได้: ระดับของ IP, หน้าเว็บจากอินเทอร์เน็ต/วงแลนเข้า 127.0.0.1, `localhost`, `[::1]` ไม่ได้, redirect ไป `file://`, ของใน cache, ไฟล์นอกโฟลเดอร์ (`..`, `%2e%2e`, `%5c`) |
 | `bash tests/check_lowd.sh [LOWD]` | `lowd`: ส่ง `index.wasm`, redirect โฟลเดอร์, 404, กัน `..`/`%2e%2e`, ปฏิเสธ POST, HEAD |
 | `node tests/check_ops.mjs` เทียบกับ `bin\wasmrun build\ops.wasm "int32()" "int64()" "floats()" "control()" "memory_ops()"` | interpreter ให้ผลตรงกับ V8 ทุกบิต (integer, float, control flow, memory, traps); `wasmrun --no-fuse` รันแบบไม่รวมคำสั่ง ต้องได้ผลเท่ากัน |
@@ -203,7 +214,7 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 | `python tests/check_cookies.py` | cookie: กฎทั้งหมดของ jar (`bin\cookietest`: domain, path, Secure, อายุ, SameSite, third-party, prefix, การบันทึกไฟล์) และผ่าน HTTP จริง: cookie จาก redirect ไปถึงหน้าถัดไป, cache ที่ `Vary: Cookie` ไม่ถูกใช้ซ้ำเมื่อ cookie เปลี่ยน |
 | `python tests/check_hpack.py` | HPACK ของ HTTP/2 ตรงกับตัวอย่างทุกข้อใน RFC 7541 Appendix C (มี/ไม่มี Huffman, dynamic table เต็มและไล่ออก), static table ตาม Appendix A, encode แล้ว decode กลับได้เหมือนเดิม |
 | `bin\fetchtest --parallel [--no-h2] URL…` | ดึงหลาย URL พร้อมกัน: HTTP/2 ใช้ connection เดียว; `--save DIR` เก็บ body ไว้เทียบกับ HTTP/1.1 |
-| `python tests/bench_viewer.py` | จับเวลา viewer กับหน้า Wikipedia 3 MB โดยไม่เปิดหน้าต่าง (`bin\viewerbench`) ทั้งแบบมีและไม่มี instruction fusion และตรวจว่าวาดภาพสุดท้ายได้เหมือนกันทุก pixel |
+| `python tests/bench_viewer.py` | จับเวลา viewer กับหน้า Wikipedia 3 MB โดยไม่เปิดหน้าต่าง (`bin\viewerbench`) ทั้งแบบมีและไม่มี instruction fusion และตรวจว่าวาดภาพสุดท้ายได้เหมือนกันทุก pixel; `viewerbench --stream N` ส่ง HTML ทีละ N ไบต์เหมือนตอนดาวน์โหลด และพิมพ์ขนาด wasm memory |
 | `python tests/check_cache.py` | HTTP cache และ keep-alive กับ server ทดสอบในเครื่อง: `max-age`, `Expires`, `ETag`/`If-None-Match`, `Last-Modified`, `no-store`, redirect ที่ cache ไว้, reload/hard reload, หลาย request บน connection เดียว (รวม chunked), `Connection: close`, connection ที่ server ปิดทิ้งแล้วต้องส่งใหม่ |
 | `python tests/check_stream.py` | ถอด gzip/zlib/deflate แบบทีละส่วน (ที่ใช้แสดงหน้าระหว่างดาวน์โหลด) จากชิ้นขนาดสุ่ม ต้องได้ไบต์ตรงกับต้นฉบับ |
 | `bin\fetchtest --stream URL…` | รับ body ทีละส่วนจาก network จริง และตรวจว่าตรงกับ body ทั้งก้อน |
@@ -211,7 +222,7 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 | `python tests/gen_hpack_huffman.py` | สร้าง `browser/hpack_huffman.h` (ตาราง Huffman ของ HPACK จาก RFC 7541) |
 | `python tests/gen_webp_tables.py` | สร้าง `browser/webp_tables.h` (ตารางค่าคงที่ของ VP8/VP8L จาก spec) |
 | `bin\fetchtest [--exact] [--cache DIR] URL…` | HTTP/HTTPS, redirect, chunked, gzip, ตรวจ certificate, กฎ `index.wasm`; log บอกว่าแต่ละ request มาจาก cache หรือใช้ connection เดิม |
-| `bin\lowweb.exe URL --size 1000x680 --log out.log --script "wait 500; click 100 200; key 83 ctrl" --screenshot out.bmp` | ขับ browser อัตโนมัติแล้วถ่ายภาพหน้าจอ (log บอกเวลานับจากเริ่มโหลด เช่น `[page +383 ms] viewer: first screen…`; คำสั่งรอจะรอให้โหลดเสร็จก่อน ยกเว้นสั่ง `async`) |
+| `bin\lowweb.exe URL --size 1000x680 --log out.log --script "wait 500; click 100 200; key 83 ctrl" --screenshot out.bmp` | ขับ browser อัตโนมัติแล้วถ่ายภาพหน้าจอ (log บอกเวลานับจากเริ่มโหลด เช่น `[page +383 ms] viewer: first screen…`; คำสั่งรอจะรอให้โหลดเสร็จก่อน ยกเว้นสั่ง `async`; `mem` เขียนการใช้หน่วยความจำลง log) |
 
 ## ข้อจำกัดที่รู้อยู่
 

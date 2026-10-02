@@ -46,24 +46,46 @@ static void *sys_alloc(u32 n) {
 
 // Small blocks come in power-of-two classes. Large ones (over 64 KB) would waste up to half
 // their size that way (a 1 MB arena chunk plus its header took a 2 MB block), so they are
-// sized in 64 KB steps and reused best-fit; one at the top of the heap goes back to it.
+// sized in 64 KB steps. A free large block is reused best-fit and split if it is bigger
+// than asked; a freed one is merged with a free block right after it, and free space at the
+// top of the heap goes back to it. (The heap is one row of blocks, each starting with its
+// class: the next block's header is at blk + size.)
 #define LARGE_CLS 0xFFu
+#define LARGE_FREE 0xFEu
 #define LARGE_STEP 65536u
-static u8 *large_free;  // freed large blocks: [u32 LARGE_CLS][u32 size][next pointer]...
+static u8 *large_free;  // free large blocks: [u32 LARGE_FREE][u32 size][next pointer]...
+
+static void large_unlink(u8 *blk) {
+    for (u8 **pp = &large_free; *pp; pp = (u8 **)(*pp + 8))
+        if (*pp == blk) {
+            *pp = *(u8 **)(blk + 8);
+            return;
+        }
+}
+
+static void large_push(u8 *blk, u32 size) {
+    *(u32 *)blk = LARGE_FREE;
+    *(u32 *)(blk + 4) = size;
+    *(u8 **)(blk + 8) = large_free;
+    large_free = blk;
+}
 
 static void *mem_alloc(u32 n) {
     if ((u64)n + 8 > LARGE_STEP) {
         u64 want = ((u64)n + 8 + LARGE_STEP - 1) & ~(u64)(LARGE_STEP - 1);
         if (want > 0xF0000000ull) return 0;
-        u8 **best = 0;
-        for (u8 **pp = &large_free; *pp; pp = (u8 **)(*pp + 8)) {
-            u32 size = *(u32 *)(*pp + 4);
-            if (size >= want && size <= want * 2 && (!best || size < *(u32 *)(*best + 4))) best = pp;
+        u8 *blk = 0;
+        for (u8 *b = large_free; b; b = *(u8 **)(b + 8)) {
+            u32 size = *(u32 *)(b + 4);
+            if (size >= want && (!blk || size < *(u32 *)(blk + 4))) blk = b;
         }
-        u8 *blk;
-        if (best) {
-            blk = *best;
-            *best = *(u8 **)(blk + 8);
+        if (blk) {
+            large_unlink(blk);
+            u32 size = *(u32 *)(blk + 4);
+            if (size > want) {  // keep the rest
+                large_push(blk + want, size - (u32)want);
+                *(u32 *)(blk + 4) = (u32)want;
+            }
         } else {
             if (!(blk = (u8 *)sys_alloc((u32)want))) return 0;
             *(u32 *)(blk + 4) = (u32)want;
@@ -86,12 +108,26 @@ static void mem_free(void *p) {
     u32 cls = *(u32 *)blk;
     if (cls == LARGE_CLS) {
         u32 size = *(u32 *)(blk + 4);
-        if ((u32)(unsigned long)(blk + size) == brk_top) {  // the last block: give it back to the heap
-            brk_top = (u32)(unsigned long)blk;
+        for (;;) {  // merge with free blocks that follow
+            u8 *next = blk + size;
+            if ((u32)(unsigned long)next >= brk_top || *(u32 *)next != LARGE_FREE) break;
+            large_unlink(next);
+            size += *(u32 *)(next + 4);
+        }
+        if ((u32)(unsigned long)(blk + size) != brk_top) {
+            large_push(blk, size);
             return;
         }
-        *(u8 **)(blk + 8) = large_free;
-        large_free = blk;
+        brk_top = (u32)(unsigned long)blk;  // the last block: give it back to the heap, and
+        for (u8 *b = large_free; b;) {      // any free block that is now the last one too
+            if ((u32)(unsigned long)(b + *(u32 *)(b + 4)) == brk_top) {
+                large_unlink(b);
+                brk_top = (u32)(unsigned long)b;
+                b = large_free;
+            } else {
+                b = *(u8 **)(b + 8);
+            }
+        }
         return;
     }
     *(void **)(blk + 8) = free_list[cls];
@@ -772,6 +808,7 @@ static int find_end_tag(const u8 *d, int n, int i, const char *name) {
 }
 
 static int parse_pos, parse_done, pre_nl_pending, plaintext_mode;
+static int parse_dropped;  // source bytes parsed and thrown away while the rest downloaded
 
 static void parse_begin(void) {
     root = new_node(N_ROOT, 0);
@@ -1261,8 +1298,14 @@ static void image_from_bytes(Img *im, const u8 *data, int len) {
     while ((u64)(w / k) * (u64)(h / k) > 2000000ull) k++;
     if (k > 1) {
         int pw = w / k, ph = h / k;
+        u32 *small = (u32 *)mem_alloc((u32)pw * (u32)ph * 4);
+        u32 *to = small ? small : px;
         for (int y = 0; y < ph; y++)
-            for (int x = 0; x < pw; x++) px[y * pw + x] = px[(y * k) * w + x * k];
+            for (int x = 0; x < pw; x++) to[y * pw + x] = px[(y * k) * w + x * k];
+        if (small) {
+            mem_free(px);
+            px = small;
+        }
         im->pw = pw;
         im->ph = ph;
     } else {
@@ -2744,6 +2787,28 @@ static Node *find_anchor(Node *n, const char *id, int len) {
 // A #fragment whose target the (incremental) layout hasn't reached yet.
 static Node *pending_anchor;
 
+static int restore_y = -1;  // a reading position to go back to (lw_restore), once laid out that far
+
+// A page the browser unloads (a tab put to sleep, back/forward, reload) is asked where the
+// reader was, and gets it back when it is loaded again: the scroll position, and whether
+// the full page was shown instead of reader view.
+LW_EXPORT(lw_state) int lw_state(void) { return (target_y < 0 ? 0 : target_y) << 1 | (full_page & 1); }
+
+LW_EXPORT(lw_restore) void lw_restore(int state) {
+    if (state <= 0) return;
+    full_page = state & 1;
+    restore_y = state >> 1;  // (and it wins over the URL's #fragment: doc_begin)
+}
+
+static void check_restore(void) {
+    if (restore_y < 0 || !has_doc) return;
+    if (pending_anchor) restore_y = -1;  // the reader followed a link meanwhile
+    else if (layout_running && laid_y < restore_y + H) return;
+    else scroll_y = target_y = clamp_scroll(restore_y);
+    restore_y = -1;
+    dirty = 1;
+}
+
 static void check_anchor(void) {
     Node *a = pending_anchor;
     if (!a || !has_doc) return;
@@ -2875,6 +2940,7 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
     int bar_x = W - (int)(12 * S);
     if (kind == LW_WHEEL) {
         pending_anchor = 0;  // the reader took over
+        restore_y = -1;
         scroll_to(target_y - button * (int)(100 * S) / 120);
         return LW_CURSOR_ARROW;
     }
@@ -2954,6 +3020,7 @@ LW_EXPORT(lw_char) void lw_char(int cp) {
 
 LW_EXPORT(lw_key) int lw_key(int key, int mods, int down) {
     if (!down) return 0;
+    restore_y = -1;  // the reader took over
     if (focus >= 0) {
         Control *k = &controls[focus];
         if (key == LW_KEY_BACKSPACE) {
@@ -3126,7 +3193,7 @@ static void show_document(void) {
     log_ms("viewer: first screen laid out in ", (int)(lw_now() - t0));
     log_ms("viewer: first screen after ", (int)(lw_now() - doc_t0));
     char m[80];
-    int k = 0, kb = parse_pos >> 10;
+    int k = 0, kb = (parse_dropped + parse_pos) >> 10;
     const char *w = "viewer: ... with this many KB parsed: ";
     while (*w) m[k++] = *w++;
     char tmp[12];
@@ -3152,7 +3219,7 @@ static void maybe_show(void) {
         if (count_text(first_main) >= 40) m = first_main;
         else if (!first_main->open) m = 0;
         else return;  // wait for more of it
-    } else if (parse_pos < (256 << 10)) {
+    } else if (parse_dropped + parse_pos < (256 << 10)) {
         return;  // no <main> yet; most pages that have one have it well before this
     } else {
         m = 0;  // show the full page for now; settled when the parse is done
@@ -3191,6 +3258,23 @@ static void pump_parse(double deadline) {
     double t0 = lw_now();
     int finished_run = parse_some(d, n, raw_done, deadline);
     parse_cpu += lw_now() - t0;
+    // What is parsed is not needed again (nodes keep their own copies): move the rest to the
+    // front, so the buffer holds what came but isn't parsed yet, not the whole document.
+    if (!raw_done && parse_pos >= (64 << 10) && parse_pos >= n - parse_pos) {
+        int rest = n - parse_pos;
+        if (doc_cs == CS_UTF8) {
+            __builtin_memmove(raw_buf, raw_buf + raw_skip + parse_pos, (u32)rest);
+            raw_len = rest;
+            raw_skip = raw_used = 0;
+        } else {  // all of raw_buf is converted by now
+            __builtin_memmove(doc_buf, doc_buf + parse_pos, (u32)rest);
+            doc_len = rest;
+            raw_len = raw_used = 0;
+        }
+        parse_dropped += parse_pos;
+        parse_pos = 0;
+        n = rest;
+    }
     parse_stuck_at = finished_run ? n : -1;
     if (raw_done && parse_pos >= n) finish_parse();
 }
@@ -3204,7 +3288,7 @@ static void doc_begin(const char *type, int type_len, const char *url, int url_l
     doc_ctype_len = MIN(type_len, (int)sizeof doc_ctype);
     __builtin_memcpy(doc_ctype, type, (u32)doc_ctype_len);
     lw_set_title(doc_url, doc_url_len);  // until the <title> is parsed
-    for (int i = 0; i < doc_url_len; i++)
+    for (int i = 0; i < doc_url_len && restore_y < 0; i++)
         if (doc_url[i] == '#') {
             frag = doc_url + i + 1;
             frag_len = doc_url_len - i - 1;
@@ -3339,6 +3423,7 @@ LW_EXPORT(lw_frame) void lw_frame(double now) {
         target_y = clamp_scroll(target_y);
     }
     check_anchor();
+    check_restore();
     if (dirty) last_progress_draw = now;
     if (scroll_y != target_y) {
         int d = target_y - scroll_y;

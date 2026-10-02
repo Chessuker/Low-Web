@@ -48,6 +48,12 @@
 //         share one block from lw_alloc that the page frees through `type`), data for
 //         each piece (decompressed; the page owns it), end (status 0 = cut off).
 //         Only for the document the viewer shows (id 0), and only if all three exist.
+//   int   lw_state(void);
+//   void  lw_restore(int state);
+//         optional: where the user is in the page (the viewer: scroll position). The browser
+//         asks before it unloads the page (back/forward, reload; for the viewer also a
+//         background tab put to sleep to save memory) and hands the number back right
+//         after lw_start when the same history entry is loaded again. 0 = nothing to restore.
 //
 // Documents the browser cannot show itself (HTML) are opened with a built-in viewer page
 // (sites/viewer/viewer.c); it receives the document as fetch id 0, streamed through

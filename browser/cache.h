@@ -24,6 +24,7 @@ struct Entry {
 // `dir` empty = keep nothing (--no-cache). The disk part is trimmed to `max_disk_bytes`.
 void init(const std::wstring &dir, uint64_t max_disk_bytes);
 bool enabled();
+size_t memory_bytes();  // bodies held by the in-memory layer
 
 bool get(const std::string &url, Entry &out);  // a stored entry, fresh or not
 void put(const Entry &e);

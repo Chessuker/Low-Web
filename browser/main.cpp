@@ -12,6 +12,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <usp10.h>
+#include <psapi.h>
 
 #ifndef EM_SETCUEBANNER
 #define EM_SETCUEBANNER 0x1501
@@ -87,7 +88,8 @@ enum : UINT {
 
 enum { ID_BACK = 101, ID_FORWARD, ID_RELOAD, ID_HOME, ID_URL, ID_ENGINE };
 enum { ID_ENGINE_FIRST = 200 };
-enum { TIMER_FRAME = 1, TIMER_SCRIPT = 2 };
+enum { TIMER_FRAME = 1, TIMER_SCRIPT = 2, TIMER_SLEEP = 3 };
+double g_sleep_after_ms = 10 * 60 * 1000.0;  // background tabs sleep after this long (--sleep-tabs-after SECONDS, 0 = never)
 
 const COLORREF kAccent = RGB(14, 165, 233);
 
@@ -187,19 +189,23 @@ struct TextEngine {
     // Width only, and fast: layout asks for tens of thousands of words, many of them again
     // and again (on every relayout). GDI's answer is remembered. (Adding up per-character
     // widths would be much faster but is not what DrawText draws: it kerns, e.g. "To".)
-    std::unordered_map<std::wstring, int> widths;  // key: size and flags, then the text
+    // The key is a 64-bit hash of size, flags and text, not the text itself (a third of the
+    // memory; two different strings with the same hash are not going to happen).
+    std::unordered_map<uint64_t, int> widths;
 
     int width(const std::wstring &s, int px, int flags) {
         px = std::clamp(px, 4, 512);
         flags &= 7;
-        std::wstring key;
-        key += (wchar_t)(px * 16 + flags);
-        key += s;
+        // (FNV-1a; size and flags go in as a step of their own: xor-ed into the start value they
+        // would cancel against the first character, e.g. "[5]" at 13 px against "k5]" at 14 px)
+        uint64_t key = (1469598103934665603ull ^ (uint64_t)(px * 16 + flags)) * 1099511628211ull;
+        for (wchar_t c : s) key = (key ^ (uint16_t)c) * 1099511628211ull;
+        key = (key ^ s.size()) * 1099511628211ull;
         auto hit = widths.find(key);
         if (hit != widths.end()) return hit->second;
         if (widths.size() > 200000) widths.clear();
         int w = measure(s, px, flags).cx;
-        widths.emplace(std::move(key), w);
+        widths.emplace(key, w);
         return w;
     }
     void ensure(int w, int h) {
@@ -297,9 +303,73 @@ void line_breaks(const uint8_t *s, int len, uint8_t *out) {
 // what a tab shows: a frame (page pixels or an image) or a native document
 struct Frame {
     int w = 0, h = 0;
-    std::vector<uint32_t> px;  // BGRA
+    std::vector<uint32_t> px;     // BGRA
+    std::vector<uint8_t> packed;  // instead of px while the tab is in the background (pack_frame)
     bool is_image = false;
 };
+
+// A background tab's picture is kept packed: a web page is mostly runs of one color, so this
+// is a few percent of its 3 MB. Tokens: varint (n << 1) then one pixel, for a run of n of it,
+// or varint (n << 1 | 1) then n pixels as they are.
+void put_varint(std::vector<uint8_t> &o, size_t v) {
+    while (v >= 0x80) { o.push_back((uint8_t)(v | 0x80)); v >>= 7; }
+    o.push_back((uint8_t)v);
+}
+
+void pack_frame(Frame &f) {
+    if (f.px.empty()) return;
+    const uint32_t *p = f.px.data();
+    size_t n = f.px.size(), i = 0;
+    std::vector<uint8_t> o;
+    o.reserve(n / 16);
+    auto put_px = [&](uint32_t c) { o.insert(o.end(), (const uint8_t *)&c, (const uint8_t *)&c + 4); };
+    while (i < n) {
+        size_t run = 1;
+        while (i + run < n && p[i + run] == p[i]) run++;
+        if (run >= 3) {
+            put_varint(o, run << 1);
+            put_px(p[i]);
+            i += run;
+            continue;
+        }
+        size_t j = i;  // pixels as they are, up to the next run of 3
+        while (j < n && !(j + 2 < n && p[j] == p[j + 1] && p[j] == p[j + 2])) j++;
+        put_varint(o, (j - i) << 1 | 1);
+        o.insert(o.end(), (const uint8_t *)(p + i), (const uint8_t *)(p + j));
+        i = j;
+    }
+    o.shrink_to_fit();
+    f.packed.swap(o);
+    std::vector<uint32_t>().swap(f.px);
+}
+
+void unpack_frame(Frame &f) {
+    if (f.packed.empty()) return;
+    size_t n = (size_t)f.w * f.h, k = 0;
+    std::vector<uint32_t> px(n);
+    const uint8_t *in = f.packed.data(), *end = in + f.packed.size();
+    while (in < end && k < n) {
+        size_t v = 0;
+        for (int sh = 0; in < end; sh += 7) {
+            v |= (size_t)(*in & 0x7F) << sh;
+            if (!(*in++ & 0x80)) break;
+        }
+        size_t cnt = std::min(v >> 1, n - k);
+        if (v & 1) {
+            cnt = std::min(cnt, (size_t)(end - in) / 4);
+            std::memcpy(px.data() + k, in, cnt * 4);
+            in += (v >> 1) * 4;
+        } else {
+            uint32_t c = 0;
+            if (end - in >= 4) std::memcpy(&c, in, 4);
+            in += 4;
+            std::fill(px.begin() + k, px.begin() + k + cnt, c);
+        }
+        k += cnt;
+    }
+    f.px.swap(px);
+    std::vector<uint8_t>().swap(f.packed);
+}
 
 struct Doc {
     std::wstring heading, body;
@@ -318,6 +388,9 @@ struct Page {
     double t0 = 0;
     int cursor = 0;
     bool crashed = false;
+    bool viewer = false;  // the HTML viewer showing a document (it can be loaded again from its URL)
+    bool typed = false;   // the user typed into it (a form): don't put the tab to sleep
+    int f_state = -1, f_restore = -1;  // optional: the page's reading position (lw_state / lw_restore)
     int f_start = -1, f_resize = -1, f_frame = -1, f_pointer = -1, f_key = -1, f_char = -1, f_alloc = -1,
         f_on_file = -1, f_on_fetch = -1, f_on_fetch_ex = -1,
         f_on_fetch_begin = -1, f_on_fetch_data = -1, f_on_fetch_end = -1;
@@ -341,6 +414,13 @@ struct Tab {
     uint64_t stream_gen = 0;  // the load (nav_gen) whose document is still streaming into the page
     net::CacheMode sub_cache = net::CacheMode::Normal;  // for the page's own fetches (hard reload: skip the cache)
     double nav_t0 = 0;        // when the current navigation started (for the log)
+    // Tabs not looked at for a while are put to sleep: the page is unloaded (it holds most of
+    // the memory) and loaded again, at the same place, when the tab is shown (sleep_tabs).
+    double hidden_since = 0;  // steady_ms() when it went into the background
+    bool asleep = false;
+    bool post_page = false;       // the page answers a form sent with POST: loading it again would send it again
+    std::vector<int> hist_state;  // for each history entry: the page's lw_state when it was left (0 = top)
+    int restore_state = 0;        // handed to the next page started in this tab (lw_restore)
 };
 
 std::vector<std::unique_ptr<Tab>> g_tabs;
@@ -372,6 +452,7 @@ struct LoadResult {
     int mode;  // 0 new entry, 1 reload, 2 history move
     int hist_target;
     net::Response r;
+    bool post = false;
 };
 // The first message of a streamed document carries its head (begin); the rest carry bytes.
 struct StreamMsg {
@@ -490,6 +571,13 @@ bool page_call(Tab &t, int f, std::initializer_list<uint64_t> args, uint64_t *re
     return true;
 }
 
+// Where the reader is in the tab's page (lw_state), to give back when it is loaded again; 0 = nothing.
+int page_state(Tab &t) {
+    uint64_t v = 0;
+    if (!t.page || t.page->crashed || t.page->f_state < 0 || !page_call(t, t.page->f_state, {}, &v)) return 0;
+    return (int)(uint32_t)v;
+}
+
 // Gives bytes to the page through lw_alloc. Returns the address or 0.
 uint32_t page_give(Tab &t, const uint8_t *data, size_t len, const std::string &extra, uint32_t &extra_at) {
     if (!t.page || t.page->f_alloc < 0) return 0;
@@ -559,6 +647,7 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
         f.w = (int)w;
         f.h = (int)h;
         f.is_image = false;
+        std::vector<uint8_t>().swap(f.packed);
         f.px.resize((size_t)w * h);
         const uint32_t *src = (const uint32_t *)(in.memory() + p);
         uint32_t *dst = f.px.data();
@@ -568,6 +657,7 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
             dst[i] = (c & 0xFF00FF00u) | (c >> 16 & 0xFF) | (c & 0xFF) << 16;
         }
         if (is_active(t)) InvalidateRect(g_view, nullptr, FALSE);
+        else pack_frame(f);
     });
     add("set_title", "ii:", [page](Instance &in, uint64_t *a) {
         std::string title = mem_str(in, a[0], a[1]);
@@ -802,9 +892,10 @@ struct DocStream : net::Stream {
     uint64_t gen = 0;
     std::string url;
     int mode = 0, hist_target = -1;
+    bool post = false;
     bool begin(const net::Response &head) override {
         if (!is_html_type(head.content_type)) return false;
-        auto *m = new StreamMsg{tab_id, gen, true, LoadResult{tab_id, gen, url, mode, hist_target, head}, {}};
+        auto *m = new StreamMsg{tab_id, gen, true, LoadResult{tab_id, gen, url, mode, hist_target, head, post}, {}};
         PostMessageW(g_main, WM_APP_STREAM, 0, (LPARAM)m);
         return true;
     }
@@ -837,7 +928,7 @@ void start_load(Tab &t, const std::string &url, int mode, int hist_target = -1, 
     int tab_id = t.id;
     cookies::Context who{initiator, true, is_post};
     std::thread([url, gen, mode, hist_target, is_post, body, tab_id, cm, who, access] {
-        auto *res = new LoadResult{tab_id, gen, url, mode, hist_target, {}};
+        auto *res = new LoadResult{tab_id, gen, url, mode, hist_target, {}, is_post};
         if (url.rfind("about:", 0) == 0) {
             res->r.status = 200;
             res->r.final_url = url;
@@ -849,6 +940,7 @@ void start_load(Tab &t, const std::string &url, int mode, int hist_target = -1, 
             stream.url = url;
             stream.mode = mode;
             stream.hist_target = hist_target;
+            stream.post = is_post;
             res->r = net::fetch(url, net::Mode::Page, 256u << 20, is_post ? &body : nullptr, &stream, cm, &who, access);
         }
         PostMessageW(g_main, WM_APP_LOADED, 0, (LPARAM)res);
@@ -952,6 +1044,9 @@ void start_wasm_page(Tab &t, const std::vector<uint8_t> &module, const std::stri
     p.f_on_fetch_begin = find_export(p, "lw_on_fetch_begin", "iiiiii");
     p.f_on_fetch_data = find_export(p, "lw_on_fetch_data", "iii");
     p.f_on_fetch_end = find_export(p, "lw_on_fetch_end", "ii");
+    p.f_state = find_export(p, "lw_state", "");
+    p.f_restore = find_export(p, "lw_restore", "i");
+    p.viewer = doc != nullptr;
     if (p.f_on_fetch_begin < 0 || p.f_on_fetch_data < 0 || p.f_on_fetch_end < 0)
         p.f_on_fetch_begin = p.f_on_fetch_data = p.f_on_fetch_end = -1;  // all or nothing
     t.page = std::move(page);
@@ -961,6 +1056,9 @@ void start_wasm_page(Tab &t, const std::vector<uint8_t> &module, const std::stri
         return;
     }
     if (!page_call(t, t.page->f_start, {})) return;
+    if (t.restore_state && t.page->f_restore >= 0) page_call(t, t.page->f_restore, {(uint32_t)t.restore_state});
+    t.restore_state = 0;
+    if (!t.page) return;
     int w, h;
     view_size(w, h);
     page_call(t, t.page->f_resize, {(uint32_t)w, (uint32_t)h});
@@ -981,6 +1079,9 @@ void commit(Tab &t, LoadResult &lr, bool streamed = false) {
     std::string url = r.final_url.empty() ? lr.requested : r.final_url;
     t.loading = streamed;
     t.stream_gen = streamed ? lr.gen : 0;
+    int left_state = page_state(t);
+    t.hist_state.resize(t.history.size());
+    if (t.page && t.hist_idx >= 0) t.hist_state[t.hist_idx] = left_state;
 
     // history
     if (lr.mode == 0) {
@@ -993,6 +1094,11 @@ void commit(Tab &t, LoadResult &lr, bool streamed = false) {
     } else if (t.hist_idx >= 0) {
         t.history[t.hist_idx] = url;
     }
+    t.hist_state.resize(t.history.size());
+    // back/forward and reload (and a tab waking up) go back to the same place; a new page starts at the top
+    t.restore_state = lr.mode == 0 || t.hist_idx < 0 ? 0 : lr.mode == 1 && left_state ? left_state : t.hist_state[t.hist_idx];
+    if (lr.mode == 0 && t.hist_idx >= 0) t.hist_state[t.hist_idx] = 0;
+    t.post_page = lr.post;
     t.current_url = url;
     bool active = is_active(&t);
     if (active) {
@@ -1069,6 +1175,44 @@ void commit(Tab &t, LoadResult &lr, bool streamed = false) {
 
 // ---- tabs --------------------------------------------------------------------------------
 
+// Makes the tab that has just become the active one ready to be seen.
+void show_tab(Tab &t) {
+    SetWindowTextW(g_url, t.typed_dirty ? t.typed.c_str() : display_url(t.current_url).c_str());
+    update_buttons();
+    update_title();
+    unpack_frame(t.frame);
+    if (t.asleep) {  // load the page again (from the cache if it can), where the reader left it
+        t.asleep = false;
+        log_line("[low-web] waking tab: " + t.current_url);
+        start_load(t, t.history[t.hist_idx], 2, t.hist_idx);
+    } else if (t.page && !t.page->crashed) {  // the view may have changed size while it was hidden
+        int w, h;
+        view_size(w, h);
+        page_call(t, t.page->f_resize, {(uint32_t)w, (uint32_t)h});
+    }
+    InvalidateRect(g_view, nullptr, FALSE);
+}
+
+// Puts background tabs to sleep that haven't been looked at for g_sleep_after_ms: their
+// page is unloaded, which gives its memory back (the viewer on a big page: 20-40 MB).
+// Only pages that can simply be loaded again: HTML documents fetched with GET that the user
+// hasn't typed into. The packed picture stays, the reading position is kept (lw_state).
+void sleep_tabs() {
+    if (g_sleep_after_ms <= 0) return;
+    double now = steady_ms();
+    for (auto &tp : g_tabs) {
+        Tab &t = *tp;
+        if (is_active(&t) || t.asleep || !t.page || t.page->crashed || !t.page->viewer || t.page->typed || t.post_page ||
+            t.loading || t.stream_gen || t.hist_idx < 0 || now - t.hidden_since < g_sleep_after_ms)
+            continue;
+        t.hist_state.resize(t.history.size());
+        t.hist_state[t.hist_idx] = page_state(t);
+        t.page.reset();
+        t.asleep = true;
+        log_line("[low-web] tab asleep: " + t.current_url);
+    }
+}
+
 void activate_tab(int index) {
     if (index < 0 || index >= (int)g_tabs.size()) return;
     // keep what the user was typing in the tab we leave
@@ -1080,23 +1224,20 @@ void activate_tab(int index) {
         old.typed_dirty = text != display_url(old.current_url) && !old.loading;
         old.typed = text;
     }
-    g_active = index;
-    Tab &t = T();
-    SetWindowTextW(g_url, t.typed_dirty ? t.typed.c_str() : display_url(t.current_url).c_str());
-    update_buttons();
-    update_title();
-    if (t.page && !t.page->crashed) {  // the view may have changed size while it was hidden
-        int w, h;
-        view_size(w, h);
-        page_call(t, t.page->f_resize, {(uint32_t)w, (uint32_t)h});
+    if (!g_tabs.empty() && g_active < (int)g_tabs.size() && g_active != index) {
+        Tab &old = T();
+        old.hidden_since = steady_ms();
+        pack_frame(old.frame);
     }
-    InvalidateRect(g_view, nullptr, FALSE);
+    g_active = index;
+    show_tab(T());
     invalidate_tabs();
 }
 
 Tab &new_tab(const std::string &url, bool foreground) {
     auto t = std::make_unique<Tab>();
     t->id = g_next_tab_id++;
+    t->hidden_since = steady_ms();
     Tab &ref = *t;
     int insert_at = g_tabs.empty() ? 0 : g_active + 1;
     // background tabs opened from the same tab go after each other
@@ -1122,16 +1263,7 @@ void close_tab(int index) {
     if (was_active) {
         int a = std::min(g_active, (int)g_tabs.size() - 1);
         g_active = a;
-        Tab &t = T();
-        SetWindowTextW(g_url, t.typed_dirty ? t.typed.c_str() : display_url(t.current_url).c_str());
-        update_buttons();
-        update_title();
-        if (t.page && !t.page->crashed) {
-            int w, h;
-            view_size(w, h);
-            page_call(t, t.page->f_resize, {(uint32_t)w, (uint32_t)h});
-        }
-        InvalidateRect(g_view, nullptr, FALSE);
+        show_tab(T());
     }
     invalidate_tabs();
 }
@@ -1224,6 +1356,7 @@ void paint_view(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     if (g_tabs.empty()) { EndPaint(hwnd, &ps); return; }
     Tab &t = T();
+    unpack_frame(t.frame);
     if (t.frame.w) {
         RECT d = frame_rect(t.frame);
         HBRUSH dark = CreateSolidBrush(t.frame.is_image ? RGB(32, 33, 36) : RGB(24, 24, 27));
@@ -1404,7 +1537,10 @@ LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         uint32_t cp = c;
         if (c >= 0xDC00 && c < 0xE000 && high_surrogate) cp = 0x10000 + ((high_surrogate - 0xD800) << 10) + (c - 0xDC00);
         high_surrogate = 0;
-        if (cp >= 32 && cp != 127 && t.page && t.page->f_char >= 0) page_call(t, t.page->f_char, {cp});
+        if (cp >= 32 && cp != 127 && t.page && t.page->f_char >= 0) {
+            t.page->typed = true;
+            page_call(t, t.page->f_char, {cp});
+        }
         return 0;
     }
     case WM_DROPFILES: {
@@ -1791,6 +1927,27 @@ void give_response(Tab &t, int id, const net::Response &r) {
         page_call(t, t.page->f_on_fetch, {(uint32_t)id, (uint32_t)r.status, p, (uint32_t)data.size()});
 }
 
+// Where the memory goes (script command "mem"): the process, then what the browser holds.
+void log_memory() {
+    PROCESS_MEMORY_COUNTERS_EX pm{};
+    pm.cb = sizeof pm;
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm);
+    auto mb = [](double b) { char s[32]; snprintf(s, sizeof s, "%.1f MB", b / 1048576.0); return std::string(s); };
+    std::string m = "[mem] working set " + mb((double)pm.WorkingSetSize) + ", private " + mb((double)pm.PrivateUsage);
+    double wasm = 0, frames = 0;
+    for (auto &t : g_tabs) {
+        if (t->page) wasm += (double)t->page->inst.memory_size();
+        frames += (double)t->frame.px.capacity() * 4 + (double)t->frame.packed.capacity();
+    }
+    size_t text_bytes = g_text.widths.size() * 32 + g_text.widths.bucket_count() * 8;  // nodes and buckets
+    int asleep = 0;
+    for (auto &t : g_tabs) asleep += t->asleep;
+    m += "; tabs " + std::to_string(g_tabs.size()) + " (" + std::to_string(asleep) + " asleep): wasm memory " + mb(wasm) + ", frames " + mb(frames) +
+         "; text widths " + std::to_string(g_text.widths.size()) + " (" + mb((double)text_bytes) + ")" +
+         "; HTTP cache in memory " + mb((double)cache::memory_bytes());
+    log_line(m);
+}
+
 // ---- automation (used by tests): --script "wait 500; click 100 200; key 83 ctrl; ..." --------
 
 void save_screenshot(const std::string &path) {
@@ -1880,6 +2037,7 @@ void script_step() {
         if (read_file(widen(path), bytes)) deliver_file(T(), bytes, base_name(widen(path)));
         else log_line("[script] cannot read " + path);
     } else if (o == "shot") { sscanf(cmd.c_str(), " %*s %511s", s1); save_screenshot(s1); }
+    else if (o == "mem") log_memory();
     else log_line("[script] unknown command: " + cmd);
 }
 
@@ -1902,6 +2060,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         make_fonts();
         update_engine_button();
         SetTimer(hwnd, TIMER_FRAME, 15, nullptr);
+        SetTimer(hwnd, TIMER_SLEEP, g_sleep_after_ms > 0 && g_sleep_after_ms < 20000 ? 250 : 10000, nullptr);
         return 0;
     }
     case WM_SIZE: layout_children(); return 0;
@@ -1989,6 +2148,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (t.page && !t.page->crashed && t.page->f_frame >= 0) page_call(t, t.page->f_frame, {wasm::from_f64(steady_ms() - t.page->t0)});
         }
         if (wp == TIMER_SCRIPT) script_step();
+        if (wp == TIMER_SLEEP) sleep_tabs();
         return 0;
     case WM_APP_LOADED: {
         std::unique_ptr<LoadResult> lr((LoadResult *)lp);
@@ -2082,7 +2242,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     net::set_logger([](const std::string &line) { log_line(line); });
 
     // command line: [URL...] [--size WxH] [--script "..."] [--screenshot out.bmp] [--save-dir DIR] [--log FILE]
-    //               [--no-cache] [--cache-dir DIR] [--cookie-file FILE] [--no-http2]
+    //               [--no-cache] [--cache-dir DIR] [--cookie-file FILE] [--no-http2] [--sleep-tabs-after SECONDS]
     std::wstring cache_dir, cookie_file;
     bool cookie_file_given = false;
     {
@@ -2116,6 +2276,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
         else if (a == "--log" && i + 1 < argc) g_log_file = _wfopen(argv[++i], L"w");
         else if (a == "--no-cache") cache_dir.clear();
         else if (a == "--no-http2") net::set_http2(false);
+        else if (a == "--sleep-tabs-after" && i + 1 < argc) g_sleep_after_ms = _wtof(argv[++i]) * 1000.0;
         else if (a == "--cache-dir" && i + 1 < argc) cache_dir = argv[++i];
         else if (a == "--cookie-file" && i + 1 < argc) { cookie_file = argv[++i]; cookie_file_given = true; }
         else start_urls.push_back(net::from_user_input(a));

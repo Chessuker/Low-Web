@@ -1,9 +1,11 @@
-// viewerbench [--no-fuse] VIEWER.wasm PAGE.html [URL] [FETCHMAP] — times the HTML viewer on a saved page
+// viewerbench [--no-fuse] [--stream N] VIEWER.wasm PAGE.html [URL] [FETCHMAP] — times the HTML viewer on a saved page
 // without a window: parse, CSS and the whole layout, split into time spent in the
 // interpreter and in host functions. FETCHMAP (lines "href<TAB>file") answers the page's
 // lw_fetch calls (stylesheets) from local files; everything else gets a 404.
 // Text is measured with a simple approximation instead of GDI, so the numbers are about
 // the interpreter. Built with -DWASM_PROFILE, it also prints which instructions ran most.
+// --stream N hands the page over in N-byte pieces with a frame after each, as while it
+// downloads (lw_on_fetch_begin/data/end), instead of all at once.
 #include <chrono>
 #include <cstdio>
 #include <deque>
@@ -39,12 +41,21 @@ struct Pending { int id; std::string href; };
 static std::deque<Pending> pending;
 
 int main(int argc, char **argv) {
-    if (argc > 1 && std::string(argv[1]) == "--no-fuse") {  // run without fused instructions
-        wasm::set_fusion(false);
-        argv++;
-        argc--;
+    size_t piece = 0;
+    for (;;) {
+        if (argc > 1 && std::string(argv[1]) == "--no-fuse") {  // run without fused instructions
+            wasm::set_fusion(false);
+            argv++;
+            argc--;
+        } else if (argc > 2 && std::string(argv[1]) == "--stream") {
+            piece = (size_t)std::max(1, atoi(argv[2]));
+            argv += 2;
+            argc -= 2;
+        } else {
+            break;
+        }
     }
-    if (argc < 3) { printf("usage: viewerbench [--no-fuse] VIEWER.wasm PAGE.html [URL] [FETCHMAP]\n"); return 2; }
+    if (argc < 3) { printf("usage: viewerbench [--no-fuse] [--stream N] VIEWER.wasm PAGE.html [URL] [FETCHMAP]\n"); return 2; }
     std::vector<uint8_t> module = read_file(argv[1]), page = read_file(argv[2]);
     std::string url = argc > 3 ? argv[3] : "https://example.com/page";
     if (argc > 4) {
@@ -132,8 +143,24 @@ int main(int argc, char **argv) {
         t0 = now_ms();
         call("lw_start", {});
         call("lw_resize", {1100, 760});
-        deliver(0, 200, page, "text/html; charset=utf-8", url);
         int frames = 0;
+        if (!piece) {
+            deliver(0, 200, page, "text/html; charset=utf-8", url);
+        } else {
+            std::string type = "text/html; charset=utf-8";
+            uint32_t meta_at;
+            uint32_t p = give({}, type + url, meta_at);
+            call("lw_on_fetch_begin", {0, 200, meta_at, type.size(), meta_at + type.size(), url.size()});
+            for (size_t at = 0; at < page.size(); at += piece) {
+                std::vector<uint8_t> part(page.begin() + at, page.begin() + std::min(page.size(), at + piece));
+                uint32_t q = give(part, "", meta_at);
+                call("lw_on_fetch_data", {0, q, part.size()});
+                call("lw_frame", {from_f64(now_ms() - t0)});
+                frames++;
+            }
+            call("lw_on_fetch_end", {0, 200});
+            (void)p;
+        }
         for (; frames < 20000 && !(layout_done && pending.empty()); frames++) {
             while (!pending.empty()) {
                 Pending p = pending.front();

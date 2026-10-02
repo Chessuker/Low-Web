@@ -27,7 +27,7 @@ uint64_t g_max_disk = 0;
 std::atomic<uint64_t> g_disk_bytes{0};
 std::atomic<bool> g_trimming{false};
 
-const size_t kMemBytes = 48u << 20;
+const size_t kMemBytes = 16u << 20;  // the disk layer has the rest, a few ms away
 const size_t kMaxEntry = 64u << 20;  // bigger bodies are not stored
 
 struct MemEntry {
@@ -58,7 +58,7 @@ void mem_drop(const std::string &url) {
 
 void mem_put(const Entry &e) {
     mem_drop(e.url);
-    if (e.body.size() > kMemBytes / 4) return;
+    if (e.body.size() > kMemBytes / 8) return;
     g_lru.push_front(e.url);
     g_mem[e.url] = MemEntry{e, g_lru.begin()};
     g_mem_bytes += e.body.size();
@@ -279,6 +279,11 @@ void init(const std::wstring &dir, uint64_t max_disk_bytes) {
 }
 
 bool enabled() { return g_on; }
+
+size_t memory_bytes() {
+    std::lock_guard<std::mutex> lock(g_m);
+    return g_mem_bytes;
+}
 
 int64_t parse_http_date(const std::string &s) { return http_date(s); }
 

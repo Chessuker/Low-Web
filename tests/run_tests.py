@@ -39,28 +39,35 @@ def ops():
 
 
 def viewer():
-    # the HTML viewer on a generated page: no trap, and the same last frame with and without
-    # fused instructions
+    # the HTML viewer on generated pages (UTF-8, and Thai in windows-874, which is converted
+    # first): no trap, and the same last frame without fused instructions, and when the page
+    # comes in small pieces as it downloads (the parsed part is thrown away meanwhile)
     os.makedirs('build/runtests', exist_ok=True)
-    page = 'build/runtests/page.html'
     rows = ''.join('<tr><td>%d</td><td>row <b>%d</b></td><td><a href="#r%d">link</a></td></tr>' % (i, i * i, i) for i in range(3000))
     items = ''.join('<li>item %d with <i>some</i> <code>text</code></li>' % i for i in range(2000))
     para = ' '.join('word%d' % i for i in range(4000))
-    with open(page, 'w', encoding='utf-8') as f:
-        f.write('<!doctype html><html><head><title>t</title><style>h1{color:#c00} .x td{padding:4px} '
-                'p.lead{font-size:20px} ul li:nth-child(odd){color:#036}</style></head><body>'
-                '<h1>Heading</h1><p class="lead">%s</p><ul>%s</ul><table class="x">%s</table>'
-                '<h2 id="end">ภาษาไทย ทดสอบ</h2><pre>  pre\n  text</pre></body></html>' % (para, items, rows))
+    html = ('<!doctype html><html><head><meta charset="%s"><title>t</title><style>h1{color:#c00} .x td{padding:4px} '
+            'p.lead{font-size:20px} ul li:nth-child(odd){color:#036}</style></head><body>'
+            '<h1>Heading</h1><p class="lead">%s</p><ul>%s</ul><table class="x">%s</table>'
+            '<h2 id="end">ภาษาไทย ทดสอบ</h2><pre>  pre\n  text</pre></body></html>')
     out = ''
-    frames = []
-    for flags in ([], ['--no-fuse']):
-        code, o = run([os.path.join(BIN, 'viewerbench.exe')] + flags + ['build/viewer.wasm', page])
-        out += o
-        fnv = [l for l in o.splitlines() if l.startswith('final frame fnv')]
-        if code or not fnv or 'trap' in o:
-            return False, out
-        frames.append(fnv[0])
-    return frames[0] == frames[1], out + '\n' + ('same final frame' if frames[0] == frames[1] else 'DIFFERENT FRAMES') + '\n'
+    ok = True
+    for name, cs, py_cs in (('page.html', 'utf-8', 'utf-8'), ('page-874.html', 'windows-874', 'cp874')):
+        page = 'build/runtests/' + name
+        with open(page, 'w', encoding=py_cs) as f:
+            f.write(html % (cs, para + ' ภาษาไทย' * 200, items, rows))
+        frames = []
+        for flags in ([], ['--no-fuse'], ['--stream', '3000']):
+            code, o = run([os.path.join(BIN, 'viewerbench.exe')] + flags + ['build/viewer.wasm', page])
+            out += '%s %s:\n%s' % (name, ' '.join(flags), o)
+            fnv = [l for l in o.splitlines() if l.startswith('final frame fnv')]
+            if code or not fnv or 'trap' in o:
+                return False, out
+            frames.append(fnv[0])
+        same = len(set(frames)) == 1
+        ok &= same
+        out += '%s: %s\n' % (name, 'same final frame' if same else 'DIFFERENT FRAMES')
+    return ok, out
 
 
 def script(*args):
@@ -76,6 +83,7 @@ TESTS = [
     ('cookies', script('tests/check_cookies.py')),
     ('hpack', script('tests/check_hpack.py', 'tests/samples/rfc7541.txt')),
     ('access', script('tests/check_access.py')),
+    ('sleep', script('tests/check_sleep.py')),
 ]
 
 only = sys.argv[1:]
