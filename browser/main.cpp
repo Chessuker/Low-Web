@@ -486,6 +486,7 @@ struct NavRequest {
     bool post = false;
     std::string body;
     int new_tab = 0;  // 0 same tab, 1 new foreground tab, 2 new background tab
+    bool replace = false;   // the page went on by itself (not the user's click or key): no new history entry
     std::string initiator;  // the page that asked (for SameSite cookies)
     net::Access access;     // what the page may send the tab to
 };
@@ -493,7 +494,7 @@ struct LoadResult {
     int tab_id;
     uint64_t gen;
     std::string requested;
-    int mode;  // 0 new entry, 1 reload, 2 history move
+    int mode;  // 0 new entry, 1 reload, 2 history move, 3 instead of the current entry
     int hist_target;
     net::Response r;
     bool post = false;
@@ -819,6 +820,9 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
     auto post_nav = [page](NavRequest *req) {
         req->tab_id = page->tab ? page->tab->id : 0;
         req->gen = page->gen;
+        // A page that sends the tab on by itself (<meta refresh>, a redirect page) takes its own
+        // place in the history: else Back goes to it, and it sends the user forward again.
+        req->replace = !g_user_input;
         req->initiator = page->url;
         req->access.files = req->url.rfind("file:", 0) != 0 || page->url.rfind("file:", 0) == 0;
         if (req->post) req->access.lowest = page->zone;
@@ -1303,7 +1307,9 @@ void commit(Tab &t, LoadResult &lr, bool streamed = false) {
     if (t.page && t.hist_idx >= 0) t.hist_state[t.hist_idx] = left_state;
 
     // history
-    if (lr.mode == 0) {
+    if (lr.mode == 3 && t.hist_idx >= 0) {
+        t.history[t.hist_idx] = url;
+    } else if (lr.mode == 0 || lr.mode == 3) {
         if (t.hist_idx + 1 < (int)t.history.size()) t.history.resize(t.hist_idx + 1);
         if (t.history.empty() || t.history.back() != url) t.history.push_back(url);
         t.hist_idx = (int)t.history.size() - 1;
@@ -1315,8 +1321,9 @@ void commit(Tab &t, LoadResult &lr, bool streamed = false) {
     }
     t.hist_state.resize(t.history.size());
     // back/forward and reload (and a tab waking up) go back to the same place; a new page starts at the top
-    t.restore_state = lr.mode == 0 || t.hist_idx < 0 ? 0 : lr.mode == 1 && left_state ? left_state : t.hist_state[t.hist_idx];
-    if (lr.mode == 0 && t.hist_idx >= 0) t.hist_state[t.hist_idx] = 0;
+    bool fresh_entry = lr.mode == 0 || lr.mode == 3;  // a page not seen at this entry before: from the top
+    t.restore_state = fresh_entry || t.hist_idx < 0 ? 0 : lr.mode == 1 && left_state ? left_state : t.hist_state[t.hist_idx];
+    if (fresh_entry && t.hist_idx >= 0) t.hist_state[t.hist_idx] = 0;
     t.post_page = lr.post;
     t.current_url = url;
     bool active = is_active(&t);
@@ -2739,6 +2746,11 @@ void script_step() {
         else log_line("[script] cannot read " + path);
     } else if (o == "shot") { sscanf(cmd.c_str(), " %*s %511s", s1); save_screenshot(s1); }
     else if (o == "mem") log_memory();
+    else if (o == "history") {  // the tab's history, the current entry marked
+        std::string h = "[history]";
+        for (int i = 0; i < (int)T().history.size(); i++) h += (i == T().hist_idx ? " *" : " ") + T().history[i];
+        log_line(h);
+    }
     else if (o == "video") {  // what the page's videos are doing
         if (T().page)
             for (auto &[id, v] : T().page->videos) {
@@ -2973,7 +2985,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Tab &nt = new_tab("", req->new_tab == 1);
             start_load(nt, req->url, 0, -1, req->post ? &req->body : nullptr, false, req->initiator, req->access);
         } else {
-            start_load(*t, req->url, 0, -1, req->post ? &req->body : nullptr, false, req->initiator, req->access);
+            start_load(*t, req->url, req->replace ? 3 : 0, -1, req->post ? &req->body : nullptr, false, req->initiator, req->access);
         }
         return 0;
     }

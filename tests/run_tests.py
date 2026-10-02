@@ -89,6 +89,7 @@ TESTS = [
     ('progressive', script('tests/check_progressive.py')),
     ('css', script('tests/check_css_layout.py')),
     ('video', script('tests/check_video.py')),
+    ('history', script('tests/check_history.py')),
 ]
 
 only = sys.argv[1:]

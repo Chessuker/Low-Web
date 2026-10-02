@@ -116,6 +116,7 @@ bin\lowweb.exe https://th.wikipedia.org/wiki/ภาษาไทย   :: เว�
 - **HTTP cache**: ทำตาม `Cache-Control` (`max-age`, `no-cache`, `no-store`), `Expires`, `ETag`/`If-None-Match`,
   `Last-Modified`/`If-Modified-Since` (ถ้า server ไม่บอกอายุ ใช้กฎ 10% ของ `Last-Modified` ไม่เกิน 1 วัน)
   เก็บในหน่วยความจำ 16 MB (ไฟล์ละไม่เกิน 2 MB) และในดิสก์ที่ `%LOCALAPPDATA%\Low-web\Cache` ไม่เกิน 256 MB (ไฟล์ที่ไม่ได้ใช้นานที่สุดถูกลบก่อน)
+- หน้าที่พาไปหน้าอื่นเอง (ไม่ได้มาจากการคลิกหรือกดคีย์ เช่น `<meta refresh>` ของหน้า redirect) จะแทนที่รายการของตัวเองในประวัติ: Back จากหน้าปลายทางจึงกลับไปหน้าก่อนหน้า redirect เลย (แบบ Chrome)
 - `F5` ถาม server ว่าหน้าเปลี่ยนไหม, `Ctrl+F5` / `Ctrl+Shift+R` โหลดใหม่ทั้งหมด, back/forward ใช้ของใน cache ถ้า server ไม่ได้สั่งให้ถามทุกครั้ง
 - `lowweb.exe --no-cache` ไม่ใช้ cache, `--cache-dir DIR` ใช้โฟลเดอร์อื่น, `--cookie-file FILE`, `--no-http2`, `--sleep-tabs-after SECONDS`;
   log (`--log`) มีบรรทัด `[net]` บอกทุก request ว่ามาจาก cache, connection เดิม/ใหม่, TLS แบบย่อ หรือ HTTP/2 stream ไหน
@@ -227,7 +228,8 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 
 | คำสั่ง | ทดสอบอะไร |
 |---|---|
-| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css, video) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css, video, history) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/check_history.py` | ประวัติ back/forward: ลิงก์ที่ผู้ใช้คลิกเพิ่มรายการ แต่หน้าที่พาไปต่อเอง (`<meta refresh>` แบบหน้า redirect ของ search engine) แทนที่รายการของตัวเอง กด Back จึงกลับไปหน้าค้นหาได้ ไม่วนกลับมาหน้าเดิม |
 | `python tests/check_video.py` | วิดีโอ (`tests/samples/colors.mp4`: แดง เขียว น้ำเงิน เหลือง อย่างละวินาที จึงดูจากภาพได้ว่าอยู่วินาทีไหน): คลิกเล่น, Space หยุด, คลิกแถบเลื่อนไป 85%, เล่นจนจบ, F เต็มจอ / Esc ออก, `<audio>`, ไฟล์ที่ไม่มีบอกเหตุผลบนภาพ, และผ่าน HTTP ช้า ๆ (`slow_server.py`) ที่ข้อมูลภาพอยู่ห่างจากต้นไฟล์ 3 MB ต้องขอเป็น range; SKIP ถ้า Windows ไม่มี Media Foundation หรือเครื่องไม่มีอุปกรณ์เสียง |
 | `python tests/check_css_layout.py` | CSS จัดหน้าจาก stylesheet: หน้ากล่องสี (flex แถว 1:2 + กว้างคงที่ + gap, float ขวา + ข้อความไหลรอบ + clear, grid 3 คอลัมน์, carousel ใน `overflow:hidden`, `justify-content:center`) แล้วหากล่องจากสีในภาพ |
 | `python tests/check_progressive.py` | หน้าที่โหลดช้า (`slow_server.py` บน port ว่าง): ตารางใหญ่แสดงแถวก่อนโหลดจบ, หน้าไม่มี `<main>` ขึ้นจอแรกก่อนโหลดจบ, `<main>` ที่มาช้ายังจบที่ reader view, และภาพสุดท้ายเหมือนโหลดทีเดียว |
