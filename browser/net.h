@@ -1,6 +1,7 @@
 // net.h — URLs and fetching: http:// and https:// over raw Winsock sockets (TLS via
 // the Windows SChannel API), plus file:// for local development.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -53,6 +54,9 @@ struct Response {
     std::vector<uint8_t> body;
     bool from_cache = false;        // served from the HTTP cache (maybe after a "not modified")
     Zone zone = Zone::Public;       // where the answer came from (file:// = Local)
+    // Media requests (Stream::range_from): where the body starts in the whole resource (0 if
+    // the server sent all of it: it doesn't do ranges) and the whole size (-1 = unknown).
+    int64_t range_start = 0, total_size = -1;
 };
 
 enum class Mode {
@@ -79,6 +83,13 @@ struct Stream {
     // everything but the body. Return true to get the body through data().
     virtual bool begin(const Response &head) = 0;
     virtual void data(const uint8_t *bytes, size_t n) = 0;
+
+    // Media (video, audio): ask for the resource from this byte on ("Range: bytes=N-"),
+    // uncompressed and past the cache, and don't keep the body in the Response (it may be far
+    // larger than memory should hold). -1: an ordinary request.
+    int64_t range_from = -1;
+    // Set (from any thread) to end the download early; fetch() then fails with "stopped".
+    std::atomic<bool> stop{false};
 };
 
 // Blocking GET (or POST when `post` is given: an application/x-www-form-urlencoded

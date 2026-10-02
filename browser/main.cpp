@@ -35,6 +35,7 @@
 #include "cookies.h"
 #include "image.h"
 #include "net.h"
+#include "video.h"
 #include "wasm.h"
 
 namespace {
@@ -84,6 +85,8 @@ enum : UINT {
     WM_APP_OPENFILE,             // lParam: OpenRequest*
     WM_APP_SAVEFILE,             // lParam: SaveRequest*
     WM_APP_STREAM,               // lParam: StreamMsg* (an HTML document arriving piece by piece)
+    WM_APP_VIDEO,                // wParam: a video's id: something about it changed (video::Player)
+    WM_APP_FULLSCREEN,           // wParam: 1 = fill the screen with the view, 0 = back (lw_fullscreen)
 };
 
 enum { ID_BACK = 101, ID_FORWARD, ID_RELOAD, ID_HOME, ID_URL, ID_ENGINE };
@@ -105,6 +108,9 @@ void find_open();  // find in page (Ctrl+F)
 void find_now(int how);
 void find_close();
 bool find_open_now();  // the strip (our title bar) is paler while another window is active
+void set_fullscreen(bool on);
+bool g_fullscreen = false;  // the view fills the screen: no tab strip, no toolbar (F11, lw_fullscreen)
+int g_fullscreen_want = -1; // asked for, not done yet (WM_APP_FULLSCREEN)
 int g_dpi = 96;
 WNDPROC g_url_proc;
 
@@ -416,7 +422,25 @@ struct Page {
         f_on_fetch_begin = -1, f_on_fetch_data = -1, f_on_fetch_end = -1;
     std::map<int, image::Image> images;
     int next_image = 1, next_fetch = 1;
+    // Videos (lw_video_*). The page says where each one goes at every frame it presents
+    // (lw_video_place); the browser draws the pictures into the frame itself, as they come.
+    struct Video {
+        std::unique_ptr<video::Player> player;
+        RECT at{}, clip{};             // where it goes in the frame, and the part of that in view
+        bool placed = false;           // by lw_video_place since the last frame
+        bool shown = false;            // in the frame on screen
+        std::vector<uint32_t> pic;     // the last picture, fitted into `at`
+        int pw = 0, ph = 0;
+        bool pic_fresh = false;        // pic is for the current size of `at`
+        // Sound only once the user asked for it (a click or key the page was handling when it
+        // said play or unmute): pages can't start making noise on their own. Until then muted.
+        bool sound_ok = false, muted = false;
+        double volume = 1;
+    };
+    std::map<int, Video> videos;  // by id (unique in the browser: WM_APP_VIDEO)
 };
+
+int g_next_video_id = 1;
 
 struct Tab {
     int id = 0;
@@ -577,6 +601,7 @@ int find_export(Page &p, const char *name, const char *params) {
 void page_crashed(Tab &t, const std::string &why) {
     if (!t.page || t.page->crashed) return;
     t.page->crashed = true;
+    t.page->videos.clear();  // (and their sound)
     log_line("[low-web] page crashed: " + why);
     show_doc(t, L"This page stopped working", widen(why) + L"\n\n" + widen(t.page->url) + L"\n\nPress F5 to load it again.", true);
 }
@@ -714,6 +739,21 @@ std::string mem_str(wasm::Instance &in, uint64_t p, uint64_t n) {
     return std::string((const char *)in.memory() + (uint32_t)p, (uint32_t)n);
 }
 
+void video_sound(Page::Video &v) {  // tests are silent
+    v.player->set_volume(v.volume, v.muted || !v.sound_ok || g_script_mode);
+}
+
+// Draws a video's last picture into its tab's frame: centred in its place, within the part in view.
+void draw_video(Tab &t, const Page::Video &v) {
+    Frame &f = t.frame;
+    if (f.px.empty() || v.pic.empty()) return;
+    int x0 = (v.at.left + v.at.right - v.pw) / 2, y0 = (v.at.top + v.at.bottom - v.ph) / 2;
+    int cl = std::max<int>({0, (int)v.clip.left, x0}), cr = std::min<int>({f.w, (int)v.clip.right, x0 + v.pw});
+    int ct = std::max<int>({0, (int)v.clip.top, y0}), cb = std::min<int>({f.h, (int)v.clip.bottom, y0 + v.ph});
+    for (int y = ct; y < cb; y++)
+        std::memcpy(&f.px[(size_t)y * f.w + cl], &v.pic[(size_t)(y - y0) * v.pw + (cl - x0)], (size_t)std::max(0, cr - cl) * 4);
+}
+
 std::vector<wasm::HostImport> make_imports(Page *page) {
     using wasm::Instance;
     std::vector<wasm::HostImport> v;
@@ -737,6 +777,11 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
         for (size_t i = 0; i < n; i++) {  // RGBA -> BGRA
             uint32_t c = src[i];
             dst[i] = (c & 0xFF00FF00u) | (c >> 16 & 0xFF) | (c & 0xFF) << 16;
+        }
+        for (auto &[vid, v] : page->videos) {  // what lw_video_place said for this frame
+            v.shown = v.placed;
+            v.placed = false;
+            if (v.shown) draw_video(*t, v);
         }
         if (is_active(t)) InvalidateRect(g_view, nullptr, FALSE);
         else pack_frame(f);
@@ -878,6 +923,81 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
         std::memcpy(in.memory() + p, text.data(), n);
         a[0] = (uint32_t)std::min<size_t>(text.size(), 0x7FFFFFFF);
     });
+    // ---- video and audio (video.h) ----
+    auto video_of = [page](uint64_t h) -> Page::Video * {
+        auto it = page->videos.find((int)(uint32_t)h);
+        return it == page->videos.end() ? nullptr : &it->second;
+    };
+    add("video_open", "ii:i", [page](Instance &in, uint64_t *a) {
+        std::string url = net::resolve(page->url, mem_str(in, a[0], a[1]));
+        a[0] = 0;
+        if (page->videos.size() >= 16) return;
+        int id = g_next_video_id++;
+        cookies::Context who{page->url, false, false};
+        Page::Video &v = page->videos[id];
+        v.player = std::make_unique<video::Player>(id, url, who, net::access_for_page(page->url, page->zone), g_main, WM_APP_VIDEO);
+        v.player->set_volume(1, true);  // (video_sound)
+        log_line("[video] " + std::to_string(id) + " open " + url);
+        a[0] = (uint32_t)id;
+    });
+    add("video_close", "i:", [page](Instance &, uint64_t *a) { page->videos.erase((int)(uint32_t)a[0]); });
+    add("video_play", "i:", [video_of](Instance &, uint64_t *a) {
+        if (auto *v = video_of(a[0])) {
+            if (g_user_input) v->sound_ok = true;
+            video_sound(*v);
+            v->player->play();
+        }
+    });
+    add("video_pause", "i:", [video_of](Instance &, uint64_t *a) { if (auto *v = video_of(a[0])) v->player->pause(); });
+    add("video_seek", "iF:", [video_of](Instance &, uint64_t *a) { if (auto *v = video_of(a[0])) v->player->seek(wasm::to_f64(a[1])); });
+    add("video_volume", "iFi:", [video_of](Instance &, uint64_t *a) {
+        if (auto *v = video_of(a[0])) {
+            v->volume = wasm::to_f64(a[1]);
+            v->muted = a[2] != 0;
+            if (g_user_input) v->sound_ok = true;
+            video_sound(*v);
+        }
+    });
+    add("video_info", "ii:i", [video_of](Instance &in, uint64_t *a) {
+        uint32_t p = (uint32_t)a[1];
+        if (!in.in_memory(p, 6 * 8)) throw wasm::Trap{"lw_video_info: bad pointer"};
+        auto *v = video_of(a[0]);
+        video::Info i;
+        if (v) i = v->player->info();
+        else { i.state = video::FAILED; }
+        double out[6] = {i.time, i.duration, i.buffered, (double)i.w, (double)i.h, i.waiting ? 1.0 : 0.0};
+        std::memcpy(in.memory() + p, out, sizeof out);
+        a[0] = (uint32_t)i.state;
+    });
+    add("video_error", "iii:i", [video_of](Instance &in, uint64_t *a) {
+        auto *v = video_of(a[0]);
+        std::string e = v ? v->player->info().error : "no such video";
+        uint32_t p = (uint32_t)a[1], n = (uint32_t)std::min<size_t>(e.size(), (uint32_t)a[2]);
+        if (!in.in_memory(p, n)) throw wasm::Trap{"lw_video_error: bad buffer"};
+        std::memcpy(in.memory() + p, e.data(), n);
+        a[0] = n;
+    });
+    add("video_place", "iiiiiiiii:", [video_of](Instance &, uint64_t *a) {
+        auto *v = video_of(a[0]);
+        if (!v) return;
+        int x = (int32_t)a[1], y = (int32_t)a[2], w = (int32_t)a[3], h = (int32_t)a[4];
+        if (w <= 0 || h <= 0 || w > 8192 || h > 8192) return;
+        RECT at{x, y, x + w, y + h};
+        if (at.right - at.left != v->at.right - v->at.left || at.bottom - at.top != v->at.bottom - v->at.top) v->pic_fresh = false;
+        v->at = at;
+        v->clip = RECT{(int32_t)a[5], (int32_t)a[6], (int32_t)a[5] + (int32_t)a[7], (int32_t)a[6] + (int32_t)a[8]};
+        v->placed = true;
+    });
+    // lw_fullscreen(1): only while handling the user's click or key, and for the tab in view;
+    // 0: back; -1: just tell. Done after the call (it resizes the page). Returns the state.
+    add("fullscreen", "i:i", [page](Instance &, uint64_t *a) {
+        int on = (int32_t)a[0];
+        if ((on == 1 && g_user_input && page->tab && is_active(page->tab)) || on == 0) {
+            g_fullscreen_want = on;
+            PostMessageW(g_main, WM_APP_FULLSCREEN, (WPARAM)on, 0);
+        }
+        a[0] = (uint32_t)(g_fullscreen_want >= 0 ? g_fullscreen_want : g_fullscreen);
+    });
     add("text_width", "iiii:i", [](Instance &in, uint64_t *a) {
         std::string s = mem_str(in, a[0], a[1]);
         a[0] = (uint32_t)g_text.width(widen(s), (int32_t)a[2], (int32_t)a[3]);
@@ -1007,6 +1127,7 @@ struct DocStream : net::Stream {
 // `initiator`: the page whose link or form started this ("" = the user); `access`: where it may lead.
 void start_load(Tab &t, const std::string &url, int mode, int hist_target = -1, const std::string *post = nullptr,
                 bool hard = false, const std::string &initiator = std::string(), const net::Access &access = net::Access()) {
+    if (g_fullscreen && is_active(&t)) set_fullscreen(false);
     net::CacheMode cm = hard ? net::CacheMode::Reload : mode == 1 ? net::CacheMode::Revalidate
                       : mode == 2 ? net::CacheMode::PreferCached : net::CacheMode::Normal;
     t.sub_cache = hard ? net::CacheMode::Reload : net::CacheMode::Normal;
@@ -1297,13 +1418,41 @@ void show_tab(Tab &t) {
 // page is unloaded, which gives its memory back (the viewer on a big page: 20-40 MB).
 // Only pages that can simply be loaded again: HTML documents fetched with GET that the user
 // hasn't typed into. The packed picture stays, the reading position is kept (lw_state).
+RECT frame_rect(const Frame &f);
+
+bool playing_media(const Tab &t) {
+    if (!t.page) return false;
+    for (auto &[id, v] : t.page->videos)
+        if (v.player->info().state == video::PLAYING) return true;
+    return false;
+}
+
+// The visible tab's videos: new pictures go straight into its frame and onto the screen.
+void new_video_pictures(Tab &t) {
+    if (!t.page || t.page->crashed || t.frame.px.empty()) return;
+    RECT d = frame_rect(t.frame);
+    for (auto &[id, v] : t.page->videos) {
+        if (!v.shown) continue;
+        int w = v.at.right - v.at.left, h = v.at.bottom - v.at.top;
+        if (!v.player->picture(w, h, !v.pic_fresh, v.pic, v.pw, v.ph)) continue;
+        v.pic_fresh = true;
+        draw_video(t, v);
+        RECT r = v.at;  // frame pixels -> the view's
+        r.left = d.left + (LONG)((double)r.left * (d.right - d.left) / t.frame.w);
+        r.right = d.left + (LONG)std::ceil((double)r.right * (d.right - d.left) / t.frame.w);
+        r.top = d.top + (LONG)((double)r.top * (d.bottom - d.top) / t.frame.h);
+        r.bottom = d.top + (LONG)std::ceil((double)r.bottom * (d.bottom - d.top) / t.frame.h);
+        InvalidateRect(g_view, &r, FALSE);
+    }
+}
+
 void sleep_tabs() {
     if (g_sleep_after_ms <= 0) return;
     double now = steady_ms();
     for (auto &tp : g_tabs) {
         Tab &t = *tp;
         if (is_active(&t) || t.asleep || !t.page || t.page->crashed || !t.page->viewer || t.page->typed || t.post_page ||
-            t.loading || t.stream_gen || t.hist_idx < 0 || now - t.hidden_since < g_sleep_after_ms)
+            t.loading || t.stream_gen || t.hist_idx < 0 || now - t.hidden_since < g_sleep_after_ms || playing_media(t))
             continue;
         t.hist_state.resize(t.history.size());
         t.hist_state[t.hist_idx] = page_state(t);
@@ -1315,6 +1464,7 @@ void sleep_tabs() {
 
 void activate_tab(int index) {
     if (index < 0 || index >= (int)g_tabs.size()) return;
+    if (g_fullscreen && index != g_active) set_fullscreen(false);
     // keep what the user was typing in the tab we leave
     if (!g_tabs.empty() && g_active < (int)g_tabs.size()) {
         Tab &old = T();
@@ -1637,6 +1787,7 @@ bool browser_key(WPARAM vk, int mods) {
         return true;
     }
     if (vk == VK_ESCAPE && find_open_now()) { find_close(); return true; }
+    if (vk == VK_F11 || (vk == VK_ESCAPE && g_fullscreen)) { set_fullscreen(!g_fullscreen); return true; }
     if ((ctrl && vk == 'L') || vk == VK_F6 || (alt && vk == 'D')) { focus_url_bar(); return true; }
     if (vk == VK_F5 || (ctrl && vk == 'R')) { reload(ctrl && (vk == VK_F5 || shift)); return true; }  // Ctrl+F5, Ctrl+Shift+R: hard
     if ((alt && vk == VK_LEFT) || vk == VK_BROWSER_BACK) { go_history(-1); return true; }
@@ -2284,6 +2435,10 @@ void layout_find_bar();
 void layout_children() {
     RECT rc;
     GetClientRect(g_main, &rc);
+    if (g_fullscreen) {
+        MoveWindow(g_view, 0, 0, rc.right, rc.bottom, TRUE);
+        return;
+    }
     int top = tabstrip_height(), th = toolbar_height(), bs = S(32), pad = S(6), y = top + (th - bs) / 2;
     int x = pad;
     for (int i = 0; i < 4; i++) {
@@ -2298,6 +2453,35 @@ void layout_children() {
     MoveWindow(g_view, 0, top + th, rc.right, std::max<int>(1, rc.bottom - top - th), TRUE);
     layout_find_bar();
     InvalidateRect(g_main, nullptr, FALSE);
+}
+
+// Fullscreen: the window loses its frame and covers its monitor; the view covers the window.
+void set_fullscreen(bool on) {
+    static WINDOWPLACEMENT place;
+    static LONG_PTR style;
+    g_fullscreen_want = -1;
+    if (on == g_fullscreen) return;
+    g_fullscreen = on;
+    for (HWND w : {g_btn[0], g_btn[1], g_btn[2], g_btn[3], g_engine_btn, g_url}) ShowWindow(w, on ? SW_HIDE : SW_SHOW);
+    if (on) {
+        if (find_open_now()) find_close();
+        place.length = sizeof place;
+        GetWindowPlacement(g_main, &place);
+        style = GetWindowLongPtrW(g_main, GWL_STYLE);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof mi;
+        GetMonitorInfoW(MonitorFromWindow(g_main, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowLongPtrW(g_main, GWL_STYLE, style & ~(WS_CAPTION | WS_THICKFRAME));
+        SetWindowPos(g_main, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        SetWindowLongPtrW(g_main, GWL_STYLE, style);
+        SetWindowPlacement(g_main, &place);
+        SetWindowPos(g_main, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    layout_children();
+    SetFocus(g_view);
+    log_line(on ? "[low-web] fullscreen" : "[low-web] fullscreen off");
 }
 
 void show_engine_menu() {
@@ -2555,6 +2739,16 @@ void script_step() {
         else log_line("[script] cannot read " + path);
     } else if (o == "shot") { sscanf(cmd.c_str(), " %*s %511s", s1); save_screenshot(s1); }
     else if (o == "mem") log_memory();
+    else if (o == "video") {  // what the page's videos are doing
+        if (T().page)
+            for (auto &[id, v] : T().page->videos) {
+                video::Info i = v.player->info();
+                char buf[256];
+                snprintf(buf, sizeof buf, "[video] %d state %d time %.2f duration %.2f size %dx%d buffered %.1f%s%s", id, i.state, i.time,
+                         i.duration, i.w, i.h, i.buffered, i.error.empty() ? "" : " error: ", i.error.c_str());
+                log_line(buf);
+            }
+    }
     else if (o == "find") {  // find TEXT: open the find bar and type TEXT
         find_open();
         SetWindowTextW(g_find_edit, widen(cmd.size() > cmd.find("find") + 5 ? cmd.substr(cmd.find("find") + 5) : "").c_str());
@@ -2612,6 +2806,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_ERASEBKGND: return 1;
     case WM_NCCALCSIZE:
+        if (wp && g_fullscreen) return 0;  // all of it is client area
         if (wp) {  // no caption: the client area goes up to the top (the side and bottom borders stay)
             auto *p = (NCCALCSIZE_PARAMS *)lp;
             LONG top = p->rgrc[0].top;
@@ -2621,6 +2816,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_NCHITTEST: {
+        if (g_fullscreen) return HTCLIENT;
         LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
         if (hit != HTCLIENT) return hit;  // the side and bottom borders
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -2728,6 +2924,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_FRAME && !g_tabs.empty()) {  // only the visible tab's page animates
             Tab &t = T();
             if (t.page && !t.page->crashed && t.page->f_frame >= 0) page_call(t, t.page->f_frame, {wasm::from_f64(steady_ms() - t.page->t0)});
+            new_video_pictures(T());
         }
         if (wp == TIMER_FRAME && find_open_now() && !g_tabs.empty() && T().id == g_find_tab && g_find_status >= 0 &&
             !showing_doc(T()))
@@ -2752,6 +2949,16 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (t->stream_gen == m->gen) stream_data(*t, m->data);
         return 0;
     }
+    case WM_APP_FULLSCREEN:
+        set_fullscreen(wp != 0);
+        return 0;
+    case WM_APP_VIDEO:
+        for (auto &tp : g_tabs)
+            if (tp->page) {
+                auto it = tp->page->videos.find((int)wp);
+                if (it != tp->page->videos.end()) it->second.player->poll();
+            }
+        return 0;
     case WM_APP_FETCHED: {
         std::unique_ptr<FetchResult> fr((FetchResult *)lp);
         Tab *t = tab_by_id(fr->tab_id);
@@ -2823,6 +3030,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
         SetProcessDPIAware();
     net::init();
     net::set_logger([](const std::string &line) { log_line(line); });
+    video::set_logger([](const std::string &line) { log_line(line); });
 
     // command line: [URL...] [--size WxH] [--script "..."] [--screenshot out.bmp] [--save-dir DIR] [--log FILE]
     //               [--no-cache] [--cache-dir DIR] [--cookie-file FILE] [--no-http2] [--sleep-tabs-after SECONDS]

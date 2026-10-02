@@ -333,6 +333,20 @@ std::shared_ptr<Stream> Connection::request(const Headers &headers, const std::s
     return st;
 }
 
+void Connection::cancel(const std::shared_ptr<Stream> &st) {
+    bool open;
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        auto it = std::find(streams_.begin(), streams_.end(), st);
+        open = it != streams_.end();
+        if (open) streams_.erase(it);
+        cv_.notify_all();
+    }
+    if (!open) return;  // already ended
+    std::lock_guard<std::mutex> w(wm_);
+    write_frame(RST_STREAM, 0, st->id, be32(8));  // CANCEL
+}
+
 void Connection::fail_all(const std::string &why, uint32_t retry_above) {
     std::lock_guard<std::mutex> lk(m_);
     for (auto it = streams_.begin(); it != streams_.end();) {

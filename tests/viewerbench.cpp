@@ -108,6 +108,16 @@ int main(int argc, char **argv) {
     });
     add("clipboard_set", "ii:", [](Instance &, uint64_t *) {});
     add("clipboard_get", "ii:i", [](Instance &, uint64_t *a) { a[0] = (uint32_t)-1; });
+    add("video_open", "ii:i", [](Instance &, uint64_t *a) { a[0] = 0; });  // (no video here)
+    add("video_close", "i:", [](Instance &, uint64_t *) {});
+    add("video_play", "i:", [](Instance &, uint64_t *) {});
+    add("video_pause", "i:", [](Instance &, uint64_t *) {});
+    add("video_seek", "iF:", [](Instance &, uint64_t *) {});
+    add("video_volume", "iFi:", [](Instance &, uint64_t *) {});
+    add("video_info", "ii:i", [](Instance &, uint64_t *a) { a[0] = 4; });
+    add("video_error", "iii:i", [](Instance &, uint64_t *a) { a[0] = 0; });
+    add("video_place", "iiiiiiiii:", [](Instance &, uint64_t *) {});
+    add("fullscreen", "i:i", [](Instance &, uint64_t *a) { a[0] = 0; });
     add("text_width", "iiii:i", [](Instance &in, uint64_t *a) {  // ~ average glyph width, per code point
         const uint8_t *s = in.memory() + (uint32_t)a[0];
         uint32_t n = (uint32_t)a[1], cps = 0;

@@ -19,8 +19,8 @@ echo [1/5] viewer   build\viewer.wasm (built into the browser)
 
 echo [2/5] browser  bin\lowweb.exe
 windres browser\lowweb.rc -O coff -o build\lowweb_res.o --include-dir browser --include-dir build || goto :fail
-%CXX% -mwindows -o bin\lowweb.exe browser\main.cpp browser\wasm.cpp browser\net.cpp browser\cache.cpp browser\cookies.cpp browser\http2.cpp browser\image.cpp browser\inflate.cpp browser\webp.cpp browser\svg.cpp ^
-  build\lowweb_res.o -lws2_32 -lsecur32 -lcomdlg32 -lgdi32 -luser32 -lshell32 -lusp10 || goto :fail
+%CXX% -mwindows -o bin\lowweb.exe browser\main.cpp browser\wasm.cpp browser\net.cpp browser\cache.cpp browser\cookies.cpp browser\http2.cpp browser\image.cpp browser\inflate.cpp browser\webp.cpp browser\svg.cpp browser\video.cpp ^
+  build\lowweb_res.o -lws2_32 -lsecur32 -lcomdlg32 -lgdi32 -luser32 -lshell32 -lusp10 -ld3d11 -lole32 -loleaut32 || goto :fail
 
 echo [3/5] server   bin\lowd.exe
 %CXX% -o build\lowd.exe server\lowd.cpp -lws2_32 || goto :fail

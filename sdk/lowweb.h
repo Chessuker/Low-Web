@@ -166,6 +166,33 @@ LW_IMPORT(line_breaks) void lw_line_breaks(const char *s, int len, unsigned char
 LW_IMPORT(clipboard_set) void lw_clipboard_set(const char *s, int len);
 LW_IMPORT(clipboard_get) int lw_clipboard_get(char *buf, int cap);
 
+// Video and audio (played by Windows: MP4/H.264, AAC, MP3, ...; more where Windows has the
+// codecs). lw_video_open starts downloading and returns a handle (0 = refused); it plays
+// after lw_video_play. The browser draws the pictures itself, into the frames the page
+// presents: at every lw_present, each video the page wants seen must have been placed with
+// lw_video_place since the previous one: x, y, w, h is its box in the frame (the picture is
+// fitted into it, keeping its shape and centred; the page paints what is around it, e.g.
+// black) and cx, cy, cw, ch the part of the frame it may cover. A video not placed for a
+// frame isn't drawn (but plays on: pause it to stop the sound).
+// lw_video_info writes 6 doubles: the current time, the duration (0 = unknown yet), how far
+// the data goes past the current time (seconds), the picture's width and height (0 = none:
+// audio only, or not known yet) and 1 if it is waiting for data; it returns the state.
+enum { LW_VIDEO_LOADING = 0, LW_VIDEO_PAUSED = 1, LW_VIDEO_PLAYING = 2, LW_VIDEO_ENDED = 3, LW_VIDEO_FAILED = 4 };
+LW_IMPORT(video_open) int lw_video_open(const char *url, int len);
+LW_IMPORT(video_close) void lw_video_close(int video);
+LW_IMPORT(video_play) void lw_video_play(int video);
+LW_IMPORT(video_pause) void lw_video_pause(int video);
+LW_IMPORT(video_seek) void lw_video_seek(int video, double seconds);
+LW_IMPORT(video_volume) void lw_video_volume(int video, double volume, int muted);  // volume 0..1
+LW_IMPORT(video_info) int lw_video_info(int video, double *info6);
+LW_IMPORT(video_error) int lw_video_error(int video, char *buf, int cap);  // why it failed (UTF-8); returns the length
+LW_IMPORT(video_place) void lw_video_place(int video, int x, int y, int w, int h, int cx, int cy, int cw, int ch);
+
+// Fullscreen: 1 asks for the page to fill the screen (works only while the page handles the
+// user's click or key), 0 goes back, -1 just asks. Returns whether it is (or is about to be:
+// the page gets lw_resize after the call). The user can leave it any time (Esc, F11).
+LW_IMPORT(fullscreen) int lw_fullscreen(int on);
+
 // ---- helpers ----------------------------------------------------------------
 
 static inline int lw_strlen(const char *s) { int n = 0; while (s[n]) n++; return n; }

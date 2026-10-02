@@ -24,6 +24,7 @@
  │   ├─ lw_present ──► framebuffer ─► StretchDIBits (จอ)                           │
  │   ├─ lw_text ─────► GDI + Uniscribe (ทุกภาษา รวมถึงไทย ตัดคำไทยถูก)              │
  │   ├─ lw_image_decode ► PNG / JPEG / GIF / WebP / SVG / BMP (เขียนเองทั้งหมด)      │
+ │   ├─ lw_video_* ──► Media Foundation ของ Windows (video.cpp: ถอดรหัสบน GPU)      │
  │   └─ lw_fetch / lw_navigate(_post) / lw_open_file / lw_save_file               │
  └──────────────────────────────────────────────────┘
 ```
@@ -32,7 +33,7 @@
 
 | โฟลเดอร์ | อะไร |
 |---|---|
-| `browser/` | ตัว browser: `main.cpp` (หน้าต่าง, แท็บ, address bar, host ของ page ABI), `wasm.cpp` (interpreter), `net.cpp` (URL, HTTP/1.1 + keep-alive), `http2.cpp` (HTTP/2 + HPACK), `conn.h` (TCP + TLS ผ่าน SChannel), `cache.cpp` (HTTP cache), `cookies.cpp` (cookie), `inflate.cpp` (DEFLATE/gzip), `image.cpp` (PNG/JPEG/GIF/BMP), `webp.cpp` (WebP lossy + lossless), `svg.cpp` (SVG renderer) |
+| `browser/` | ตัว browser: `main.cpp` (หน้าต่าง, แท็บ, address bar, host ของ page ABI), `wasm.cpp` (interpreter), `net.cpp` (URL, HTTP/1.1 + keep-alive), `http2.cpp` (HTTP/2 + HPACK), `conn.h` (TCP + TLS ผ่าน SChannel), `cache.cpp` (HTTP cache), `cookies.cpp` (cookie), `inflate.cpp` (DEFLATE/gzip), `image.cpp` (PNG/JPEG/GIF/BMP), `webp.cpp` (WebP lossy + lossless), `svg.cpp` (SVG renderer), `video.cpp` (วิดีโอ/เสียงผ่าน Media Foundation) |
 | `server/lowd.cpp` | web server สำหรับ host เว็บ Low-web (Windows + Linux) |
 | `sdk/lowweb.h` | **Page ABI**: สัญญาระหว่างหน้าเว็บกับ browser |
 | `sdk/hello.c` | หน้าเว็บตัวอย่างที่เล็กที่สุด (~1 KB) ใช้เป็นแม่แบบ |
@@ -77,6 +78,7 @@ bin\lowweb.exe https://th.wikipedia.org/wiki/ภาษาไทย   :: เว�
 | `Alt+Enter` ในช่อง address | เปิดในแท็บใหม่ |
 | คลิกกลาง / `Ctrl`+คลิกลิงก์ | เปิดลิงก์ในแท็บเบื้องหลัง |
 | `F5` · `Ctrl+F5` · `Alt+←/→` · `Alt+Home` | reload (ถาม server ว่าเปลี่ยนไหม) · reload โดยไม่ใช้ cache · back/forward · home |
+| `F11` · `Esc` | เต็มจอ (ไม่มีแถบแท็บและ toolbar) · ออกจากเต็มจอ |
 | `Ctrl+F` · `Enter`/`F3` · `Shift+Enter`/`Shift+F3` · `Esc` | ค้นหาในหน้า (แถบมุมขวาบน บอก "ลำดับ/ทั้งหมด", ไม่สนตัวพิมพ์เล็กใหญ่) · อันถัดไป · อันก่อนหน้า · ปิด |
 
 ลากไฟล์ `.wasm` มาวางเพื่อรัน · ลากรูปมาวางบน Paint เพื่อเปิดรูป
@@ -168,9 +170,10 @@ address ทำงานเหมือนเว็บปกติ:
 | รูป | PNG, JPEG, GIF, **WebP** (lossy, lossless, alpha, animation เฟรมแรก), **SVG** (ไฟล์ `.svg` และ `<svg>` ที่ฝังในหน้า), BMP; `<picture>`/`srcset`; `data:` URI |
 | Reader view | ถ้าเว็บมี `<main>`/`role=main` จะแสดงแค่ส่วนนั้น คลิกป้ายมุมขวาล่างเพื่อสลับไปดูทั้งหน้า |
 | Form | text/password/checkbox/radio/select/textarea/submit, ส่งแบบ GET และ POST |
+| วิดีโอ, เสียง | `<video>` และ `<audio controls>` (`src` หรือ `<source>`: เลือกชนิดที่ Windows เล่นได้ก่อน, `poster`): กรอบภาพ + แถบปุ่ม (เล่น/หยุด, เวลา, แถบเลื่อนตำแหน่งที่ลากได้, เต็มจอ, ปิดเสียง); **ไม่โหลดอะไรจนกว่าจะกดเล่น** (ไม่มี autoplay); คีย์ Space/K เล่น-หยุด, ←/→ ถอย/ข้าม 5 วินาที, M ปิดเสียง, F หรือดับเบิลคลิกภาพ = เต็มจอ (Esc ออก) |
 | อื่น ๆ | ลิงก์, `#anchor` (รวมถึง URL ที่มี `#` ตั้งแต่เปิด: เลื่อนไปเมื่อจัดหน้าถึง; ภาษาไทยได้ทั้งแบบตัวอักษรตรง ๆ และแบบ `%E0%B8…`), `<meta refresh>`, scroll (ล้อเมาส์, คีย์บอร์ด, scrollbar), ค้นหาในหน้า (`lw_find`) |
 
-ไม่มี: JavaScript, CSS `position` (absolute/fixed/sticky วางตามลำดับปกติ), margin/padding/สีพื้นจาก stylesheet (ใช้ได้เฉพาะใน `style=""`), inline-block จริง, AVIF
+ไม่มี: JavaScript (จึงเล่นวิดีโอของ YouTube, Facebook, TikTok, Netflix ไม่ได้: เว็บพวกนี้ใช้ JS ดึงวิดีโอเป็นท่อน ๆ และบางเว็บมี DRM; HLS/DASH ก็ยังไม่มี), CSS `position` (absolute/fixed/sticky วางตามลำดับปกติ), margin/padding/สีพื้นจาก stylesheet (ใช้ได้เฉพาะใน `style=""`), inline-block จริง, AVIF
 (เว็บที่ต้องใช้ JS อย่างผลค้นหาของ Google จึงใช้ไม่ได้ ส่วน DuckDuckGo Lite, Wikipedia, Hacker News, BBC ใช้ได้)
 
 ## เขียนเว็บของตัวเอง
@@ -202,6 +205,8 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 | `lw_key`, `lw_char` | `lw_fetch` → ผลกลับมาทาง `lw_on_fetch` / `lw_on_fetch_ex` |
 | `lw_alloc` (ให้ browser ขอหน่วยความจำ) | `lw_open_file` → `lw_on_file`, `lw_save_file`, `lw_clipboard_set/get` |
 | `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (เอกสารแบบ stream), `lw_state`/`lw_restore` (ตำแหน่งที่อ่านอยู่), `lw_find` (ค้นหาในหน้า) (สามตัวหลังไม่บังคับ) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
+| | `lw_video_open/play/pause/seek/volume/info/error/close`: วิดีโอและเสียง; หน้าเว็บบอกตำแหน่งด้วย `lw_video_place` ทุกครั้งที่ `lw_present` แล้ว browser วาดภาพลงไปเอง (ไม่ผ่าน interpreter ทีละเฟรม); เริ่มมีเสียงได้เฉพาะตอนผู้ใช้คลิก/กดคีย์ (นอกนั้นเล่นแบบปิดเสียง) |
+| | `lw_fullscreen` เต็มจอ (เฉพาะตอนผู้ใช้คลิก/กดคีย์; ผู้ใช้ออกได้ด้วย Esc/F11) |
 
 ## Host จริง
 
@@ -222,7 +227,8 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 
 | คำสั่ง | ทดสอบอะไร |
 |---|---|
-| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css, video) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/check_video.py` | วิดีโอ (`tests/samples/colors.mp4`: แดง เขียว น้ำเงิน เหลือง อย่างละวินาที จึงดูจากภาพได้ว่าอยู่วินาทีไหน): คลิกเล่น, Space หยุด, คลิกแถบเลื่อนไป 85%, เล่นจนจบ, F เต็มจอ / Esc ออก, `<audio>`, ไฟล์ที่ไม่มีบอกเหตุผลบนภาพ, และผ่าน HTTP ช้า ๆ (`slow_server.py`) ที่ข้อมูลภาพอยู่ห่างจากต้นไฟล์ 3 MB ต้องขอเป็น range; SKIP ถ้า Windows ไม่มี Media Foundation หรือเครื่องไม่มีอุปกรณ์เสียง |
 | `python tests/check_css_layout.py` | CSS จัดหน้าจาก stylesheet: หน้ากล่องสี (flex แถว 1:2 + กว้างคงที่ + gap, float ขวา + ข้อความไหลรอบ + clear, grid 3 คอลัมน์, carousel ใน `overflow:hidden`, `justify-content:center`) แล้วหากล่องจากสีในภาพ |
 | `python tests/check_progressive.py` | หน้าที่โหลดช้า (`slow_server.py` บน port ว่าง): ตารางใหญ่แสดงแถวก่อนโหลดจบ, หน้าไม่มี `<main>` ขึ้นจอแรกก่อนโหลดจบ, `<main>` ที่มาช้ายังจบที่ reader view, และภาพสุดท้ายเหมือนโหลดทีเดียว |
 | `python tests/check_edit.py` | ช่องกรอก (พิมพ์, ลูกศร, Home/End, Shift เลือก, Delete/Backspace, ตัด, สระไทย, ดับเบิลคลิก, ลากเลือก, Tab, textarea), `#fragment` ภาษาไทยแบบตรงและแบบ `%`, ค้นหาในหน้า (นับ, ถัดไป/ก่อนหน้า, ตัวพิมพ์, ไม่เจอ, ไฟล์ข้อความ) |
@@ -253,5 +259,8 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
   หน้า Wikipedia ขนาด 3 MB: parse ~0.12 วินาที, จัดหน้าครั้งแรก ~0.29 วินาที (จัดใหม่ตอนรูปมา ~0.08 วินาที),
   จอแรกขึ้นประมาณ 0.4 วินาทีหลังกด Enter ครั้งแรก และ ~0.2 วินาทีเมื่อ CSS อยู่ใน cache แล้ว; หน้า Low-web ที่ค้างเกิน 5 วินาที (viewer: 20 วินาที) จะถูกหยุด
 - ยังไม่มี TLS 1.3 (SChannel ของ Windows 10 ยังไม่เปิด TLS 1.3 ให้ฝั่ง client จึงใช้ TLS 1.2)
+- วิดีโอเล่นด้วย Media Foundation ของ Windows: Windows รุ่น N ต้องลง Media Feature Pack, เครื่องที่ไม่มีอุปกรณ์เสียงเล่นไม่ได้
+  (Media Foundation ต้องมี), ไฟล์ MP4 ที่มี B-frame ภาพจะช้ากว่าเสียงไม่กี่เฟรม (Media Foundation ไม่สน edit list);
+  CPU ขณะเล่น: H.264 640×360 ~5% ของหนึ่ง core, MPEG-4 Part 2 ของ Wikipedia ~14% (ถอดรหัสด้วย CPU)
 - กันหน้าเว็บจากอินเทอร์เน็ตไม่ให้เข้าเครื่องนี้/วงแลน/ไฟล์ได้แล้ว (ดู "หน้าเว็บเข้าถึงอะไรได้บ้าง") แต่ยังไม่มี same-origin policy
   เต็มรูปแบบ

@@ -115,6 +115,12 @@ std::string content_type_for(const std::string &path) {
     if (ends(".bmp")) return "image/bmp";
     if (ends(".html") || ends(".htm")) return "text/html";
     if (ends(".json")) return "application/json";
+    if (ends(".mp4") || ends(".m4v")) return "video/mp4";
+    if (ends(".webm")) return "video/webm";
+    if (ends(".mov")) return "video/quicktime";
+    if (ends(".mp3")) return "audio/mpeg";
+    if (ends(".m4a")) return "audio/mp4";
+    if (ends(".wav")) return "audio/wav";
     return "application/octet-stream";
 }
 
@@ -192,6 +198,23 @@ Response load_file(const Url &u, Mode mode, size_t max_bytes, Stream *stream, co
     }
     LARGE_INTEGER sz;
     GetFileSizeEx(f, &sz);
+    if (stream && stream->range_from >= 0) {  // media: piece by piece from the byte asked for
+        r.status = 200;
+        r.content_type = content_type_for(path);
+        r.total_size = sz.QuadPart;
+        r.range_start = std::min<int64_t>(stream->range_from, sz.QuadPart);
+        if (stream->begin(r)) {
+            LARGE_INTEGER at;
+            at.QuadPart = r.range_start;
+            SetFilePointerEx(f, at, nullptr, FILE_BEGIN);
+            std::vector<uint8_t> buf(256 << 10);
+            DWORD got = 0;
+            while (!stream->stop && ReadFile(f, buf.data(), (DWORD)buf.size(), &got, nullptr) && got) stream->data(buf.data(), got);
+        }
+        CloseHandle(f);
+        if (stream->stop) { r.status = 0; r.error = "stopped"; }
+        return r;
+    }
     if ((uint64_t)sz.QuadPart > max_bytes) {
         CloseHandle(f);
         r.error = "file is too large";
@@ -312,13 +335,14 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
                       Stream *stream, CacheMode cmode, const cookies::Context *who, const Access &access) {
     const std::string url = u.str();
     ULONGLONG t_start = GetTickCount64();
+    const bool media = stream && stream->range_from >= 0;  // a range, not cached, not kept (net.h: Stream)
     cookies::Context ctx = who ? *who : cookies::Context{};
     ctx.unsafe_method = post != nullptr;
     const std::string cookie = cookies::header_for(url, ctx);
 
     // ---- the cache: fresh enough to use as it is? else ask "has it changed?"
     cache::Entry cached;
-    bool have = !post && cmode != CacheMode::Reload && cache::get(url, cached);
+    bool have = !post && !media && cmode != CacheMode::Reload && cache::get(url, cached);
     if (have && !cached.vary.empty() && cached.vary != vary_key(cookie)) have = false;  // made for other cookies
     if (have && (Zone)cached.zone < access.lowest) have = false;  // from a server this request may not reach
     if (have) {
@@ -346,8 +370,9 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
                       "Accept: " + std::string(mode == Mode::Page
                                                    ? "application/wasm, text/html;q=0.9, text/plain;q=0.8, image/*;q=0.8, */*;q=0.5"
                                                    : "*/*") + "\r\n"
-                      "Accept-Encoding: gzip, deflate\r\n"
+                      "Accept-Encoding: " + std::string(media ? "identity" : "gzip, deflate") + "\r\n"
                       "Accept-Language: th, en;q=0.8\r\n";
+    if (media) req += "Range: bytes=" + std::to_string(stream->range_from) + "-\r\n";
     if (have && !cached.etag.empty()) req += "If-None-Match: " + cached.etag + "\r\n";
     if (have && !cached.last_modified.empty()) req += "If-Modified-Since: " + cached.last_modified + "\r\n";
     if (cmode == CacheMode::Reload) req += "Cache-Control: no-cache\r\n";
@@ -366,6 +391,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     bool chunked = false, done = false, no_body = false, last_chunk = false;
     size_t cpos = 0;       // chunked: next chunk header in raw
     size_t body_end = 0;   // chunked: where the message ends in raw (after the trailer)
+    size_t dropped = 0;    // media: body bytes handed on and removed from the front of raw
     std::map<std::string, std::string> hdrs;
     std::vector<std::string> set_cookie;  // (a header that may come many times)
 
@@ -375,6 +401,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     std::unique_ptr<deflate::Stream> dec;
     std::string dec_err;
     auto pump = [&](const std::vector<uint8_t> &body, size_t avail, bool final) {
+        if (media && stream->stop) return false;
         if (!streaming || (avail <= fed && !final)) return true;
         const uint8_t *p = body.data() + fed;
         size_t n = avail - fed;
@@ -396,6 +423,18 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         no_body = r.status == 204 || r.status == 304 || (r.status >= 100 && r.status < 200);
         bool redirect = r.status >= 300 && r.status < 400 && hdrs.count("location");
         if (stream && !no_body && !redirect) {
+            if (media) {  // which part of the whole this is: "Content-Range: bytes 100-999/1000"
+                r.range_start = 0;
+                r.total_size = -1;
+                const std::string &cr = hdrs["content-range"];
+                size_t sp = cr.find(' '), slash = cr.find('/');
+                if (r.status == 206 && sp != std::string::npos && slash != std::string::npos) {
+                    r.range_start = atoll(cr.c_str() + sp + 1);
+                    if (cr[slash + 1] != '*') r.total_size = atoll(cr.c_str() + slash + 1);
+                } else if (r.status == 200 && hdrs.count("content-length")) {
+                    r.total_size = atoll(hdrs["content-length"].c_str());
+                }
+            }
             std::string enc = lower(hdrs["content-encoding"]);
             if (enc.empty() || enc == "identity" || enc == "gzip" || enc == "x-gzip" || enc == "deflate") {
                 r.content_type = hdrs["content-type"];
@@ -423,7 +462,8 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         h2::Headers hh = {{":method", post ? "POST" : "GET"}, {":scheme", "https"}, {":authority", host_hdr},
                           {":path", percent_encode_path(target)}, {"user-agent", "Low-web/0.1"},
                           {"accept", mode == Mode::Page ? "application/wasm, text/html;q=0.9, text/plain;q=0.8, image/*;q=0.8, */*;q=0.5" : "*/*"},
-                          {"accept-encoding", "gzip, deflate"}, {"accept-language", "th, en;q=0.8"}};
+                          {"accept-encoding", media ? "identity" : "gzip, deflate"}, {"accept-language", "th, en;q=0.8"}};
+        if (media) hh.push_back({"range", "bytes=" + std::to_string(stream->range_from) + "-"});
         if (have && !cached.etag.empty()) hh.push_back({"if-none-match", cached.etag});
         if (have && !cached.last_modified.empty()) hh.push_back({"if-modified-since", cached.last_modified});
         if (cmode == CacheMode::Reload) hh.push_back({"cache-control", "no-cache"});
@@ -493,7 +533,11 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
                 if (k == 0) break;
                 r.body.insert(r.body.end(), piece.begin(), piece.end());
                 if (r.body.size() > max_bytes) { r.status = 0; r.error = "response is too large"; return r; }
-                if (!pump(r.body, r.body.size(), false)) break;  // (the decoder's error is reported below)
+                if (!pump(r.body, r.body.size(), false)) {  // (the decoder's error is reported below)
+                    if (media && stream->stop) hc->cancel(st);  // else the server goes on sending it
+                    break;
+                }
+                if (media && !dec) { r.body.clear(); fed = 0; }  // handed on: not kept
             }
         }
     }
@@ -601,12 +645,23 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
             }
             if (!pump(r.body, r.body.size(), false)) break;
             if (done) break;
+            if (media && !dec) {  // handed on: not kept
+                r.body.clear();
+                fed = 0;
+                raw.erase(raw.begin(), raw.begin() + cpos);
+                cpos = 0;
+            }
         } else {
-            size_t avail = content_length >= 0 ? std::min(raw.size(), (size_t)content_length) : raw.size();
+            size_t avail = content_length >= 0 ? std::min(raw.size(), (size_t)content_length - dropped) : raw.size();
             if (!pump(raw, avail, false)) break;
-            if (content_length >= 0 && raw.size() >= (size_t)content_length) {
+            if (content_length >= 0 && raw.size() + dropped >= (size_t)content_length) {
                 done = true;
                 break;
+            }
+            if (media && !dec) {
+                raw.erase(raw.begin(), raw.begin() + fed);
+                dropped += fed;
+                fed = 0;
             }
         }
     }
@@ -619,15 +674,24 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     }
     // exactly one whole response read, and the server keeps the connection: reuse it
     reusable = done && lower(hdrs["connection"]).find("close") == std::string::npos &&
-                    (no_body ? raw.empty() : chunked ? raw.size() == body_end : content_length >= 0 && raw.size() == (size_t)content_length);
+                    (no_body ? raw.empty() : chunked ? raw.size() == body_end : content_length >= 0 && raw.size() + dropped == (size_t)content_length);
     if (!chunked) {
         if (content_length >= 0) {
-            if (raw.size() < (size_t)content_length) { r.status = 0; r.error = "the response was cut off"; return r; }
-            raw.resize((size_t)content_length);
+            if (raw.size() + dropped < (size_t)content_length) {
+                r.status = 0;
+                r.error = media && stream->stop ? "stopped" : "the response was cut off";
+                return r;
+            }
+            raw.resize((size_t)content_length - dropped);
         }
         r.body.swap(raw);
     }
     }  // HTTP/1.1
+    if (media && stream->stop) {  // (an HTTP/1.1 connection left mid-body is closed, not reused)
+        r.status = 0;
+        r.error = "stopped";
+        return r;
+    }
     r.content_type = hdrs["content-type"];
     location = hdrs["location"];
     std::string enc = lower(hdrs["content-encoding"]);
@@ -686,7 +750,8 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
 
     // ---- keep it for next time, if the server allows
     int64_t now = cache::now_ms(), fresh = 0;
-    if (!post && cache::enabled() && cache::freshness(r.status, hdrs, now, fresh)) {
+    if (media) r.body.clear();
+    if (!post && !media && cache::enabled() && cache::freshness(r.status, hdrs, now, fresh)) {
         cache::Entry e;
         e.url = url;
         e.status = r.status;

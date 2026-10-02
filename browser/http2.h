@@ -70,6 +70,8 @@ public:
     // take more (closing, broken): open another one.
     std::shared_ptr<Stream> request(const Headers &headers, const std::string *body);
     bool usable();
+    // Gives up on a stream (RST_STREAM CANCEL): the server stops sending its body.
+    void cancel(const std::shared_ptr<Stream> &st);
     const std::string &key() const { return key_; }
     net::Zone zone() const;  // of the server's address
 

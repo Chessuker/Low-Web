@@ -1041,7 +1041,7 @@ typedef struct {
     int link;
 } Style;
 
-enum { IT_TEXT, IT_RECT, IT_IMAGE, IT_CONTROL };
+enum { IT_TEXT, IT_RECT, IT_IMAGE, IT_CONTROL, IT_VIDEO };
 typedef struct {
     u8 kind, flags, deco;
     u8 layer;      // 1: in a float (painted after the rest, as CSS paints floats above blocks)
@@ -1443,33 +1443,14 @@ static int decodable_type(const char *t) {
            ieq(t, "image/bmp") || ieq(t, "image/webp") || ieq(t, "image/svg+xml");
 }
 
-static int image_for(Node *n) {
-    if (n->ref >= 0) return n->ref;
-    const char *src = 0;
-    if (n->parent && n->parent->tag == T_PICTURE) {  // <picture>: first <source> we can decode
-        for (Node *c = n->parent->first; c && c != n && !src; c = c->next) {
-            if (c->type != N_ELEM || c->tag != T_SOURCE || !decodable_type(attr(c, "type"))) continue;
-            const char *media = attr(c, "media");
-            if (media && !media_matches(media, media + lw_strlen(media))) continue;
-            const char *set = attr(c, "srcset");
-            if (set && *set) src = pick_srcset(set);
-            if (src && undecodable_url(src, lw_strlen(src))) src = 0;
-        }
-    }
-    if (!src) src = attr(n, "src");
-    const char *lazy = attr(n, "data-src");
-    if (lazy && *lazy && (!src || !*src || iprefix(src, lw_strlen(src), "data:"))) src = lazy;
-    const char *set = attr(n, "srcset");
-    if (set && *set && (!src || !*src || undecodable_url(src, lw_strlen(src)))) {
-        const char *alt = pick_srcset(set);
-        if (alt && (!src || !*src || !undecodable_url(alt, lw_strlen(alt)))) src = alt;
-    }
+// The image at this URL (in imgs), made (queued for fetching) if there is none yet.
+static int img_for_url(const char *src) {
     if (src && *src)  // the same picture used again (icons, bullets): fetch and decode it once
         for (int i = 0; i < nimgs; i++) {
             const char *a = imgs[i].url, *b = src;
             if (!a) continue;
             while (*a && *a == *b) a++, b++;
-            if (*a == *b) return n->ref = i;
+            if (*a == *b) return i;
         }
     imgs = (Img *)grow_array(imgs, nimgs, &imgs_cap, sizeof(Img));
     Img *im = &imgs[nimgs];
@@ -1523,9 +1504,33 @@ static int image_for(Node *n) {
     } else if (undecodable_url(src, len)) {
         im->state = IMG_FAILED;
     }
-    n->ref = nimgs++;
-    return n->ref;
+    return nimgs++;
 }
+
+static int image_for(Node *n) {
+    if (n->ref >= 0) return n->ref;
+    const char *src = 0;
+    if (n->parent && n->parent->tag == T_PICTURE) {  // <picture>: first <source> we can decode
+        for (Node *c = n->parent->first; c && c != n && !src; c = c->next) {
+            if (c->type != N_ELEM || c->tag != T_SOURCE || !decodable_type(attr(c, "type"))) continue;
+            const char *media = attr(c, "media");
+            if (media && !media_matches(media, media + lw_strlen(media))) continue;
+            const char *set = attr(c, "srcset");
+            if (set && *set) src = pick_srcset(set);
+            if (src && undecodable_url(src, lw_strlen(src))) src = 0;
+        }
+    }
+    if (!src) src = attr(n, "src");
+    const char *lazy = attr(n, "data-src");
+    if (lazy && *lazy && (!src || !*src || iprefix(src, lw_strlen(src), "data:"))) src = lazy;
+    const char *set = attr(n, "srcset");
+    if (set && *set && (!src || !*src || undecodable_url(src, lw_strlen(src)))) {
+        const char *alt = pick_srcset(set);
+        if (alt && (!src || !*src || !undecodable_url(alt, lw_strlen(alt)))) src = alt;
+    }
+    return n->ref = img_for_url(src);
+}
+
 
 static int in_flight;
 static void pump_images(void) {
@@ -1659,6 +1664,106 @@ static void flow_image(Ctx *c, Node *n, const Style *st) {
     Item *it = place_box(c, w, h, IT_IMAGE, st);
     if (it) it->ref = n->ref;
     if (c->measure && pct_max_width(n)) c->min_w = min_before;  // it can be as narrow as the room: it needs none
+}
+
+// ---- video and audio ------------------------------------------------------------------
+// <video>, and <audio controls>: the picture (the poster until it plays) with a bar of
+// controls under it. Nothing is downloaded until the user clicks play (no autoplay: it
+// costs data and memory); then the browser plays it (lw_video_*) and draws its pictures
+// into our frame itself, where draw_video_item says (lw_video_place). The bar is under the
+// picture, not on it, since the browser's pictures cover whatever we draw there.
+
+typedef struct {
+    Node *node;
+    int audio;           // <audio>: the bar alone
+    int poster;          // imgs index, -1 = none
+    int handle;          // lw_video_open's; 0 = not opened yet
+    int state, waiting, muted;
+    double t, dur, buf;  // seconds: where it is, how long, how far the data goes on from t
+    int vw, vh;          // the picture's size, once known
+    int laid_vw;         // the vw the layout used (it lays out again when it changes)
+    int shown;           // what the bar shows, in short: it is drawn again when this changes
+    int visible;         // drawn in the last frame: item `item` at `screen_y`
+    int item, screen_y;
+    const char *error;   // FAILED: why
+} Video;
+static Video *videos;
+static int nvideos, videos_cap, video_focus = -1, video_drag = -1, bars_dirty;
+// Fullscreen: one video fills the view (and the browser the screen), drawn as full_item.
+static int video_full = -1;
+static Item full_item;
+
+static int video_for(Node *n) {
+    if (n->ref >= 0) return n->ref;
+    videos = (Video *)grow_array(videos, nvideos, &videos_cap, sizeof(Video));
+    Video *v = &videos[nvideos];
+    __builtin_memset(v, 0, sizeof *v);
+    v->node = n;
+    v->audio = n->tag == T_AUDIO;
+    v->poster = -1;
+    v->state = LW_VIDEO_PAUSED;
+    const char *p = attr(n, "poster");
+    if (p && *p && !v->audio) v->poster = img_for_url(p);  // (fetched with the page's images)
+    return n->ref = nvideos++;
+}
+
+// Kinds Windows plays as it comes (MP4/H.264, AAC, MP3, WAV).
+static int common_media(const char *t) {
+    static const char *const ok[] = {"video/mp4", "audio/mp4", "audio/mpeg", "audio/mp3", "audio/aac", "audio/wav", "audio/x-wav",
+                                     "audio/wave", "video/quicktime", "audio/x-m4a", "video/x-m4v"};
+    int len = lw_strlen(t);
+    for (int i = 0; i < (int)(sizeof ok / sizeof ok[0]); i++)
+        if (iprefix(t, len, ok[i])) return 1;
+    return 0;
+}
+
+// What to play: src, else the first <source> of a common kind, else any <source> but a
+// streaming playlist (HLS, DASH: those need JavaScript); 0 if there is nothing.
+static const char *video_src(Node *n) {
+    const char *s = attr(n, "src");
+    if (s && *s) return s;
+    const char *other = 0;
+    for (Node *c = n->first; c; c = c->next) {
+        if (c->type != N_ELEM || c->tag != T_SOURCE) continue;
+        const char *u = attr(c, "src"), *t = attr(c, "type");
+        if (!u || !*u) continue;
+        if (!t || !*t || common_media(t)) return u;
+        if (!other && !iprefix(t, lw_strlen(t), "application/")) other = u;
+    }
+    return other;
+}
+
+#define VIDEO_BAR ((int)(36 * S))
+static int video_css_width(Node *n, int of, int em);  // (after css.c)
+
+static void flow_video(Ctx *c, Node *n, const Style *st) {
+    int vi = video_for(n);
+    Video *v = &videos[vi];
+    if (v->audio && !attr(n, "controls")) return;  // an <audio> without controls shows nothing
+    int avail = c->measure ? -1 : c->w;
+    int cw = video_css_width(n, avail, st->size), w, ph = 0;
+    if (v->audio) {
+        w = cw > 0 ? cw : (int)(300 * S);
+    } else {
+        int nw = v->vw, nh = v->vh;  // its shape: the video's, else the poster's, else 16:9
+        Img *po = v->poster >= 0 ? &imgs[v->poster] : 0;
+        if ((!nw || !nh) && po && po->state == IMG_READY) { nw = po->nat_w; nh = po->nat_h; }
+        if (!nw || !nh) { nw = 640; nh = 360; }
+        v->laid_vw = v->vw;
+        int pct = 0;
+        int aw = parse_int(attr(n, "width"), &pct);
+        if (pct) aw = avail > 0 ? (int)(aw * avail / 100 / S) : -1;  // (CSS px)
+        int ah = parse_int(attr(n, "height"), &pct);
+        if (pct) ah = -1;
+        w = cw > 0 ? cw : aw > 0 ? (int)(aw * S) : ah > 0 ? (int)((long long)ah * nw / nh * S) : (int)(nw * S);
+        ph = aw > 0 && ah > 0 ? (int)((long long)w * ah / aw) : (int)((long long)w * nh / nw);
+    }
+    if (avail > 0 && w > avail) { ph = (int)((long long)ph * avail / w); w = avail; }
+    if (w < 1) w = 1;
+    int min_before = c->min_w;
+    Item *it = place_box(c, w, ph + VIDEO_BAR, IT_VIDEO, st);
+    if (it) { it->ref = vi; it->link = -1; }
+    if (c->measure) c->min_w = MAX(min_before, MIN(w, (int)(200 * S)));  // it can shrink
 }
 
 // ---- form controls --------------------------------------------------------------------
@@ -2345,6 +2450,10 @@ static int box_kind(Node *n, const Ctx *c, int em) {
     return BOX_NORMAL;
 }
 
+static int video_css_width(Node *n, int of, int em) {  // the CSS width in device pixels, -1 = none
+    return len_px(lay_items(n), LP_WIDTH, em, of, -1);
+}
+
 static int pct_max_width(Node *n) {  // width or max-width in %: its min-content size counts as 0
     const Lay *l = lay_items(n);
     return l && ((l->has[LP_MAXW] && l->unit[LP_MAXW] == U_PCT) || (l->has[LP_WIDTH] && l->unit[LP_WIDTH] == U_PCT));
@@ -2426,7 +2535,8 @@ static int box_children(Node *n, Node **out, int max) {
             int ws = 1;
             for (u32 i = 0; i < ch->len && ws; i++) ws = ch->text[i] == ' ';
             if (!ws) out[k++] = ch;
-        } else if (ch->type == N_ELEM && !((tag_flags[ch->tag] & FS) && ch->tag != T_SVG) && !is_hidden(ch)) {
+        } else if (ch->type == N_ELEM && !((tag_flags[ch->tag] & FS) && ch->tag != T_SVG && ch->tag != T_VIDEO && ch->tag != T_AUDIO) &&
+                   !is_hidden(ch)) {
             out[k++] = ch;
         }
     }
@@ -2680,6 +2790,12 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
     if (n->type == N_TEXT) { flow_text(c, n, parent); return; }
     if (n->type != N_ELEM) return;
     int tag = n->tag;
+    if ((tag == T_VIDEO || tag == T_AUDIO) && !is_hidden(n)) {
+        n->y = c->y + c->margin;
+        n->lpass = layout_pass;
+        flow_video(c, n, parent);
+        return;
+    }
     if ((tag_flags[tag] & FS) && tag != T_SVG) return;
     if (is_hidden(n)) return;
     Style st = *parent;
@@ -3128,6 +3244,165 @@ static void draw_image(Item *it, int y) {
             u32 s = src[(u64)(i - it->x) * (u64)im->pw / (u64)it->w];
             dst[i] = (s >> 24) == 255 ? s : blend(dst[i], s);
         }
+    }
+}
+
+static void fill_circle(int cx, int cy, int r, u32 col) {
+    for (int dy = -r, dx = 0; dy <= r; dy++) {
+        while ((dx + 1) * (dx + 1) + dy * dy <= r * r) dx++;
+        while (dx > 0 && dx * dx + dy * dy > r * r) dx--;
+        fill(cx - dx, cy + dy, 2 * dx + 1, 1, col);
+    }
+}
+
+static void fill_play(int x, int cy, int h, u32 col) {  // a play triangle h tall, its left side at x
+    int half = h / 2;
+    for (int dy = -half; dy <= half; dy++) fill(x, cy + dy, (half - (dy < 0 ? -dy : dy)) * 173 / 100 + 1, 1, col);
+}
+
+static int fmt_time(char *o, double sec) {  // m:ss or h:mm:ss
+    int t = sec > 0 ? (int)sec : 0, h = t / 3600, m = t / 60 % 60, k = 0;
+    char tmp[12];
+    int v = h ? h : m, n = 0;
+    do { tmp[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) o[k++] = tmp[--n];
+    if (h) { o[k++] = ':'; o[k++] = (char)('0' + m / 10); o[k++] = (char)('0' + m % 10); }
+    o[k++] = ':';
+    o[k++] = (char)('0' + t % 60 / 10);
+    o[k++] = (char)('0' + t % 10);
+    return k;
+}
+
+// Where the parts of a video's box are (y: its top on the screen).
+typedef struct {
+    int px, py, pw, ph;  // the picture
+    int by;              // the bar's top
+    int bx1;             // the play button: [it->x, bx1)
+    int tx0, tx1;        // the seek track
+    int time_x;          // the time text
+    int fx0;             // the fullscreen button: [fx0, mx0) (none for <audio>: fx0 == mx0)
+    int mx0;             // the mute button: [mx0, right edge)
+} VGeo;
+
+static void video_geo(const Item *it, int y, VGeo *g) {
+    const Video *v = &videos[it->ref];
+    int bar = VIDEO_BAR;
+    g->px = it->x;
+    g->py = y;
+    g->pw = it->w;
+    g->ph = it->h - bar;
+    g->by = y + g->ph;
+    g->bx1 = it->x + bar;
+    g->time_x = g->bx1;
+    const char *sample = v->dur >= 3600 ? "0:00:00 / 0:00:00" : "00:00 / 00:00";
+    g->tx0 = g->time_x + lw_text_width(sample, lw_strlen(sample), (int)(12 * S), 0) + (int)(12 * S);
+    g->mx0 = it->x + it->w - bar;
+    g->fx0 = v->audio ? g->mx0 : g->mx0 - bar;
+    g->tx1 = g->fx0 - (int)(8 * S);
+    if (g->tx1 - g->tx0 < (int)(30 * S)) g->tx0 = g->tx1;  // too narrow for a track
+}
+
+static void draw_video_bar(Item *it, int y);
+
+static void draw_video_item(Item *it, int y) {
+    Video *v = &videos[it->ref];
+    v->visible = 1;
+    v->item = it == &full_item ? -2 : (int)(it - items);
+    v->screen_y = y;
+    VGeo g;
+    video_geo(it, y, &g);
+    int live = v->handle && v->state != LW_VIDEO_FAILED;
+    if (!v->audio) {
+        fill(g.px, g.py, g.pw, g.ph, RGB(0, 0, 0));
+        Img *po = v->poster >= 0 ? &imgs[v->poster] : 0;
+        if (po && po->state == IMG_READY && po->nat_w > 0 && po->nat_h > 0) {  // fitted, centred
+            int fw = g.pw, fh = (int)((long long)g.pw * po->nat_h / po->nat_w);
+            if (fh > g.ph) { fh = g.ph; fw = (int)((long long)g.ph * po->nat_w / po->nat_h); }
+            Item tmp = *it;
+            tmp.x = g.px + (g.pw - fw) / 2;
+            tmp.w = fw;
+            tmp.h = fh;
+            tmp.ref = v->poster;
+            if (fw > 0 && fh > 0) draw_image(&tmp, g.py + (g.ph - fh) / 2);
+        }
+        int cx = g.px + g.pw / 2, cy = g.py + g.ph / 2;
+        if (v->state == LW_VIDEO_FAILED) {
+            int size = (int)(13 * S);
+            const char *m = "Can't play this video";
+            lw_text(fb, W, H, g.px + (int)(12 * S), g.py + (int)(10 * S), m, lw_strlen(m), size, LW_TEXT_BOLD, RGB(255, 255, 255));
+            if (v->error) lw_text(fb, W, H, g.px + (int)(12 * S), g.py + (int)(10 * S) + ascent(size) + descent(size), v->error,
+                                  lw_strlen(v->error), size, 0, RGB(200, 200, 200));
+        } else if (!live) {  // not started: a big play button
+            int r = MIN((int)(34 * S), MIN(g.pw, g.ph) / 4);
+            fill_circle(cx, cy, r, RGBA(0, 0, 0, 150));
+            fill_play(cx - r * 3 / 10, cy, r, RGB(255, 255, 255));
+        }
+        if (live) lw_video_place(v->handle, g.px, g.py, g.pw, g.ph, 0, 0, W, H);  // the browser draws it there
+    }
+    draw_video_bar(it, y);
+}
+
+// The bar: play/pause, time, seek track, mute.
+static void draw_video_bar(Item *it, int y) {
+    Video *v = &videos[it->ref];
+    VGeo g;
+    video_geo(it, y, &g);
+    int bar = VIDEO_BAR, cy = g.by + bar / 2;
+    u32 white = RGB(255, 255, 255);
+    fill(it->x, g.by, it->w, bar, RGB(28, 28, 31));
+    if (video_focus == it->ref) fill(it->x, g.by, it->w, MAX(1, (int)S), RGB(14, 165, 233));
+    int ih = (int)(14 * S), bx = it->x + (bar - ih) / 2;
+    if (v->state == LW_VIDEO_PLAYING) {
+        fill(bx + ih / 6, cy - ih / 2, ih / 4, ih, white);
+        fill(bx + ih * 7 / 12, cy - ih / 2, ih / 4, ih, white);
+    } else {
+        fill_play(bx + ih / 6, cy, ih, white);
+    }
+    char tb[48];
+    int k;
+    int size = (int)(12 * S);
+    if (v->handle && (v->state == LW_VIDEO_LOADING || v->waiting)) {
+        const char *m = "Loading\xE2\x80\xA6";
+        k = lw_strlen(m);
+        __builtin_memcpy(tb, m, (u32)k);
+    } else {
+        k = fmt_time(tb, v->t);
+        tb[k++] = ' ';
+        tb[k++] = '/';
+        tb[k++] = ' ';
+        if (v->dur > 0) k += fmt_time(tb + k, v->dur);
+        else { tb[k++] = '-'; tb[k++] = '-'; }
+    }
+    lw_text(fb, W, H, g.time_x, cy - (ascent(size) + descent(size)) / 2, tb, k, size, 0, white);
+    if (g.tx1 > g.tx0) {
+        int th = MAX(3, (int)(4 * S)), ty = cy - th / 2, tw = g.tx1 - g.tx0;
+        fill(g.tx0, ty, tw, th, RGBA(255, 255, 255, 70));
+        if (v->dur > 0) {
+            int pos = (int)(tw * MIN(1.0, v->t / v->dur)), got = (int)(tw * MIN(1.0, (v->t + v->buf) / v->dur));
+            if (got > pos) fill(g.tx0 + pos, ty, got - pos, th, RGBA(255, 255, 255, 120));
+            fill(g.tx0, ty, pos, th, RGB(14, 165, 233));
+            fill_circle(g.tx0 + pos, cy, (int)(6 * S), white);
+        }
+    }
+    if (g.fx0 < g.mx0) {  // fullscreen: four corners (in fullscreen, pointing in)
+        int fx = g.fx0 + (bar - ih) / 2, fy = cy - ih / 2, t = MAX(2, (int)(2 * S)), l = ih * 3 / 8, in = video_full == it->ref;
+        for (int c = 0; c < 4; c++) {  // an L in each corner, its arms meeting at the outer (inner) corner
+            int x0 = c & 1 ? fx + ih - l : fx, y0 = c & 2 ? fy + ih - l : fy;
+            int right = (c & 1) ? !in : in, bottom = (c & 2) ? !in : in;
+            fill(x0, bottom ? y0 + l - t : y0, l, t, white);
+            fill(right ? x0 + l - t : x0, y0, t, l, white);
+        }
+    }
+    int mx = g.mx0 + (bar - ih) / 2;  // a speaker; muted: with a cross
+    fill(mx, cy - ih / 5, ih / 4, ih * 2 / 5, white);
+    for (int d = 0; d < ih / 3; d++) fill(mx + ih / 4 + d, cy - ih / 5 - d, 1, ih * 2 / 5 + 2 * d, white);
+    if (v->muted) {
+        for (int d = 0; d < ih / 3; d++) {
+            fill(mx + ih * 2 / 3 + d, cy - ih / 6 + d, MAX(1, (int)(1.5f * S)), MAX(1, (int)(1.5f * S)), white);
+            fill(mx + ih * 2 / 3 + d, cy + ih / 6 - d, MAX(1, (int)(1.5f * S)), MAX(1, (int)(1.5f * S)), white);
+        }
+    } else {
+        fill(mx + ih * 3 / 4, cy - ih / 4, MAX(1, (int)(1.5f * S)), ih / 2, white);
     }
 }
 
@@ -3725,6 +4000,19 @@ static void redraw(void) {
     int s0 = -1, s1 = -1;
     const char *q0 = 0, *q1 = 0;
     if (!sel_range(&s0, &q0, &s1, &q1)) s0 = s1 = -1;
+    for (int i = 0; i < nvideos; i++) videos[i].visible = 0;
+    if (video_full >= 0) {  // just the video, over all of the view
+        fill(0, 0, W, H, RGB(0, 0, 0));
+        __builtin_memset(&full_item, 0, sizeof full_item);
+        full_item.kind = IT_VIDEO;
+        full_item.w = W;
+        full_item.h = H;
+        full_item.ref = video_full;
+        full_item.link = -1;
+        draw_video_item(&full_item, 0);
+        lw_present(fb, W, H);
+        return;
+    }
     for (int pass = 0; pass < (nfloats ? 2 : 1); pass++)
     for (int i = 0; i < draw_limit; i++) {
         Item *it = &items[i];
@@ -3746,6 +4034,7 @@ static void redraw(void) {
             break;
         case IT_IMAGE: draw_image(it, y); break;
         case IT_CONTROL: draw_control(it, y); break;
+        case IT_VIDEO: draw_video_item(it, y); break;
         }
     }
     if (js_notice) {
@@ -3983,10 +4272,179 @@ static int item_at(int x, int y, int kind) {
     int dy = y + scroll_y;
     for (int i = draw_limit - 1; i >= 0; i--) {
         Item *it = &items[i];
-        if (kind == IT_CONTROL ? it->kind != IT_CONTROL : it->link < 0) continue;
+        if (kind == IT_CONTROL || kind == IT_VIDEO ? it->kind != kind : it->link < 0) continue;
         if (x >= it->x && x < it->x + it->w && dy >= it->y && dy < it->y + it->h) return i;
     }
     return -1;
+}
+
+// Play, or pause; the first time, opens it.
+static void video_toggle(int vi) {
+    Video *v = &videos[vi];
+    dirty = 1;
+    if (!v->handle) {
+        const char *src = video_src(v->node);
+        if (!src) {
+            v->state = LW_VIDEO_FAILED;
+            v->error = "it names no file to play (the site may play it with JavaScript)";
+            return;
+        }
+        v->handle = lw_video_open(src, lw_strlen(src));
+        if (!v->handle) {
+            v->state = LW_VIDEO_FAILED;
+            v->error = "too many videos on this page";
+            return;
+        }
+        v->state = LW_VIDEO_LOADING;
+        if (v->muted) lw_video_volume(v->handle, 1, 1);
+        lw_video_play(v->handle);
+    } else if (v->state == LW_VIDEO_PLAYING) {
+        lw_video_pause(v->handle);
+    } else if (v->state != LW_VIDEO_FAILED) {
+        if (v->state == LW_VIDEO_ENDED) lw_video_seek(v->handle, 0);
+        lw_video_play(v->handle);
+    }
+}
+
+static void video_fullscreen(int vi, int on) {
+    if (on) {
+        lw_fullscreen(1);  // (the browser says no unless the user clicked or pressed a key)
+        video_full = vi;
+        video_focus = vi;
+    } else {
+        lw_fullscreen(0);
+        video_full = -1;
+    }
+    dirty = 1;
+}
+
+static void video_seek_to(int vi, double t) {
+    Video *v = &videos[vi];
+    if (!v->handle || v->dur <= 0) return;
+    v->t = t < 0 ? 0 : t > v->dur ? v->dur : t;  // (shown at once)
+    lw_video_seek(v->handle, v->t);
+    dirty = 1;
+}
+
+static Item *video_item(int vi) {
+    if (vi == video_full) return &full_item;
+    for (int i = 0; i < draw_limit; i++)
+        if (items[i].kind == IT_VIDEO && items[i].ref == vi) return &items[i];
+    return 0;
+}
+
+static int item_screen_y(const Item *it) { return it == &full_item ? 0 : it->y - scroll_y; }
+
+static double pic_click_t;
+static int pic_click_vi = -1;
+
+// A press on a video's picture or bar, or a drag along its track. 1 if it was one.
+static int video_pointer(int kind, int x, int y, int button) {
+    if (video_drag >= 0) {
+        Item *it = video_item(video_drag);
+        if (it && (kind == LW_MOVE || kind == LW_UP)) {
+            VGeo g;
+            video_geo(it, item_screen_y(it), &g);
+            video_seek_to(video_drag, videos[video_drag].dur * (x - g.tx0) / MAX(g.tx1 - g.tx0, 1));
+        }
+        if (kind == LW_UP || !it) video_drag = -1;
+        return 1;
+    }
+    int ii = video_full >= 0 ? -1 : item_at(x, y, IT_VIDEO);
+    if (ii < 0 && video_full < 0) {
+        if (kind == LW_DOWN && video_focus >= 0) { video_focus = -1; dirty = 1; }
+        return 0;
+    }
+    if (kind != LW_DOWN || button != 0) return 1;
+    Item *it = video_full >= 0 ? &full_item : &items[ii];
+    int vi = it->ref;
+    Video *v = &videos[vi];
+    if (video_focus != vi) { video_focus = vi; dirty = 1; }
+    VGeo g;
+    video_geo(it, item_screen_y(it), &g);
+    if (y < g.by) {  // the picture: play or pause; twice quickly: fullscreen (and as it was)
+        double now = lw_now();
+        int twice = pic_click_vi == vi && now - pic_click_t < 400;
+        video_toggle(vi);
+        if (twice && !v->audio) video_fullscreen(vi, video_full != vi);
+        pic_click_t = twice ? 0 : now;
+        pic_click_vi = vi;
+    } else if (x < g.bx1) video_toggle(vi);  // the play button
+    else if (x >= g.fx0 && x < g.mx0) video_fullscreen(vi, video_full != vi);
+    else if (x >= g.mx0) {
+        v->muted = !v->muted;
+        if (v->handle) lw_video_volume(v->handle, 1, v->muted);
+        dirty = 1;
+    } else if (g.tx1 > g.tx0 && x >= g.tx0 - (int)(8 * S)) {
+        video_drag = vi;
+        video_seek_to(vi, v->dur * (x - g.tx0) / MAX(g.tx1 - g.tx0, 1));
+    }
+    return 1;
+}
+
+// Keys for the video clicked last: Space or K plays/pauses, arrows go 5 s back/on, M mutes.
+static int video_key(int key) {
+    if (video_focus < 0) return 0;
+    Video *v = &videos[video_focus];
+    if (key == LW_KEY_SPACE || key == 'K') video_toggle(video_focus);
+    else if (key == 'F' && !v->audio) video_fullscreen(video_focus, video_full != video_focus);
+    else if (key == LW_KEY_ESCAPE && video_full >= 0) video_fullscreen(video_full, 0);
+    else if ((key == LW_KEY_LEFT || key == LW_KEY_RIGHT) && v->handle) video_seek_to(video_focus, v->t + (key == LW_KEY_LEFT ? -5 : 5));
+    else if (key == 'M') {
+        v->muted = !v->muted;
+        if (v->handle) lw_video_volume(v->handle, 1, v->muted);
+        dirty = 1;
+    } else return 0;
+    return 1;
+}
+
+// Each frame: what the playing videos are doing. Their bars are drawn again when what they
+// show changes (the browser draws the pictures by itself).
+static void videos_tick(void) {
+    for (int i = 0; i < nvideos; i++) {
+        Video *v = &videos[i];
+        if (!v->handle) continue;
+        double inf[6];
+        int st = lw_video_info(v->handle, inf);
+        if (st == LW_VIDEO_FAILED && v->state != LW_VIDEO_FAILED) {
+            char e[300];
+            int n = lw_video_error(v->handle, e, (int)sizeof e);
+            v->error = arena_str(e, MAX(0, MIN(n, (int)sizeof e)));
+        }
+        v->state = st;
+        if (video_drag != i) v->t = inf[0];
+        v->dur = inf[1];
+        v->buf = inf[2];
+        v->vw = (int)inf[3];
+        v->vh = (int)inf[4];
+        v->waiting = inf[5] != 0;
+        const char *aw = attr(v->node, "width"), *ah = attr(v->node, "height");
+        if (!v->audio && v->vw && v->vw != v->laid_vw && !(aw && ah)) need_layout = 1;  // now its shape is known
+        int shown = st * 2 + v->waiting + (int)v->t * 16 + (int)v->dur * 7919;
+        if (v->dur > 0) shown += (int)(v->t * 400 / v->dur) * 104729 + (int)((v->t + v->buf) * 100 / v->dur) * 1299709;
+        if (shown != v->shown) {
+            v->shown = shown;
+            if (v->visible) bars_dirty = 1;
+        }
+    }
+}
+
+// Only the bars changed (time, progress): draw them again over the last frame, place the
+// pictures again (the browser draws only the videos placed for each frame) and show it.
+// Far cheaper than drawing the whole page several times a second while a video plays.
+static void redraw_bars(void) {
+    for (int i = 0; i < nvideos; i++) {
+        Video *v = &videos[i];
+        if (!v->visible || v->item < -2 || v->item == -1 || v->item >= nitems) continue;
+        Item *it = v->item == -2 ? &full_item : &items[v->item];
+        draw_video_bar(it, v->screen_y);
+        if (v->handle && v->state != LW_VIDEO_FAILED && !v->audio) {
+            VGeo g;
+            video_geo(it, v->screen_y, &g);
+            lw_video_place(v->handle, g.px, g.py, g.pw, g.ph, 0, 0, W, H);
+        }
+    }
+    lw_present(fb, W, H);
 }
 
 static int pressed_link = -1;
@@ -3999,6 +4457,10 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
     mouse_in = kind != LW_LEAVE;
     hover_scroll = scroll_y;
     int bar_x = W - (int)(12 * S);
+    if (video_full >= 0) {
+        if (kind != LW_WHEEL && kind != LW_LEAVE) video_pointer(kind, x, y, button);
+        return LW_CURSOR_ARROW;
+    }
     if (kind == LW_WHEEL) {
         pending_anchor = 0;  // the reader took over
         restore_y = -1;
@@ -4048,6 +4510,10 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
         }
         if (kind == LW_UP && button == 0) field_drag = 0;
         return LW_CURSOR_TEXT;
+    }
+    if (!sel_drag && video_pointer(kind, x, y, button)) {
+        if (hover_link >= 0 || hover_control >= 0) { hover_link = hover_control = -1; dirty = 1; }
+        return LW_CURSOR_HAND;
     }
     drag_x = x;
     drag_y = y;
@@ -4228,6 +4694,7 @@ LW_EXPORT(lw_key) int lw_key(int key, int mods, int down) {
     int ctrl = mods & LW_CTRL, shift = mods & LW_SHIFT;
     int copy = (ctrl && key == 'C') || (ctrl && key == LW_KEY_INSERT), paste = (ctrl && key == 'V') || (shift && key == LW_KEY_INSERT);
     int cut = ctrl && key == 'X';
+    if (focus < 0 && !(mods & (LW_CTRL | LW_ALT)) && video_key(key)) return 1;
     if (focus >= 0) {
         Control *k = &controls[focus];
         int secret = k->kind == K_PASSWORD, area = k->kind == K_TEXTAREA, a, b;
@@ -4717,8 +5184,15 @@ LW_EXPORT(lw_frame) void lw_frame(double now) {
         if (l != hover_link) { hover_link = l; dirty = 1; }
     }
     if (focus >= 0 && (int)((now - caret_t) / 530) != (int)((now - 16 - caret_t) / 530)) dirty = 1;
-    if (!dirty) return;
+    videos_tick();
+    if (video_full >= 0 && !lw_fullscreen(-1)) { video_full = -1; dirty = 1; }
+    if (!dirty) {
+        if (bars_dirty && has_doc) redraw_bars();
+        bars_dirty = 0;
+        return;
+    }
     dirty = 0;
+    bars_dirty = 0;
     if (!has_doc) {
         u32 bg = RGB(255, 255, 255);
         fill_span(fb, W * H, bg);
