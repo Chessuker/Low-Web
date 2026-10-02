@@ -77,12 +77,18 @@ bin\lowweb.exe https://th.wikipedia.org/wiki/ภาษาไทย   :: เว�
 | `Alt+Enter` ในช่อง address | เปิดในแท็บใหม่ |
 | คลิกกลาง / `Ctrl`+คลิกลิงก์ | เปิดลิงก์ในแท็บเบื้องหลัง |
 | `F5` · `Ctrl+F5` · `Alt+←/→` · `Alt+Home` | reload (ถาม server ว่าเปลี่ยนไหม) · reload โดยไม่ใช้ cache · back/forward · home |
+| `Ctrl+F` · `Enter`/`F3` · `Shift+Enter`/`Shift+F3` · `Esc` | ค้นหาในหน้า (แถบมุมขวาบน บอก "ลำดับ/ทั้งหมด", ไม่สนตัวพิมพ์เล็กใหญ่) · อันถัดไป · อันก่อนหน้า · ปิด |
 
 ลากไฟล์ `.wasm` มาวางเพื่อรัน · ลากรูปมาวางบน Paint เพื่อเปิดรูป
 
 **เลือก คัดลอก วางข้อความ**: ลากเมาส์เพื่อเลือก, ดับเบิลคลิก = คำ, คลิกสามครั้ง = ทั้งย่อหน้า, `Shift`+คลิก = ขยายส่วนที่เลือก,
 `Ctrl+A` เลือกทั้งหน้า, `Ctrl+C` คัดลอก (ขึ้นบรรทัดใหม่ตามหน้า), ลากเลยขอบบน/ล่างแล้วหน้าเลื่อนตาม; ในช่องกรอก `Ctrl+V` วาง,
 `Ctrl+A` แล้ว `Ctrl+C`/`Ctrl+X` คัดลอก/ตัด (ช่องรหัสผ่านคัดลอกไม่ได้); หน้าที่ browser แสดงเอง (ไฟล์ข้อความ, หน้า error) ก็เลือกและคัดลอกได้
+
+**ช่องกรอก**: มี caret และส่วนที่เลือก: `←/→` (`Ctrl` = ทีละคำ), `Home/End`, `Shift`+ปุ่มเหล่านี้ = เลือก, `Backspace`/`Delete`
+(`Ctrl` = ทั้งคำ), คลิกวาง caret, ลากเลือก, ดับเบิลคลิก = คำ, คลิกสามครั้ง = ทั้งหมด, `Tab`/`Shift+Tab` ไปช่องถัดไป/ก่อนหน้า;
+ข้อความยาวเลื่อนตาม caret; `<textarea>` ตัดบรรทัดเอง, `Enter` ขึ้นบรรทัดใหม่, `↑/↓` ทีละบรรทัด; สระ/วรรณยุกต์ไทยไปกับตัวอักษรข้างหน้า
+(ลบด้วย `Backspace` ได้ทีละตัว)
 หน้า Low-web ใช้ clipboard ผ่าน `lw_clipboard_set`/`lw_clipboard_get`: เขียนได้เฉพาะตอนจัดการ input ของผู้ใช้
 และอ่านได้เฉพาะตอนผู้ใช้กด `Ctrl+V`/`Shift+Insert` เท่านั้น หน้าเว็บจึงแอบอ่านหรือเขียนทับ clipboard ไม่ได้
 
@@ -156,14 +162,15 @@ address ทำงานเหมือนเว็บปกติ:
 | Charset | UTF-8, windows-874/TIS-620 (เว็บไทยรุ่นเก่า รวมถึง google.com), windows-1252/Latin-1 |
 | HTML | tokenizer + tree builder (ปิด tag อัตโนมัติแบบ HTML5 ส่วนใหญ่), character references |
 | Layout | block/inline, ตัดบรรทัด (ไทยตัดตามคำด้วย Uniscribe), หัวข้อ, list, `pre`, ตาราง (colspan, ความกว้างอัตโนมัติ), `bgcolor`/`color`/`align`, inline `style` บางส่วน |
-| แสดงผลทีละส่วน | HTML ถูกส่งให้ viewer **ระหว่างดาวน์โหลด** (gzip ก็ถอดทีละส่วน) และ parse ไปพร้อมกัน; เจอ `<link rel=stylesheet>` ก็โหลด CSS ทันที; จัดหน้าจากบนลงล่างครั้งละ ~12 ms ต่อเฟรม จอแรกขึ้นทันทีที่จัดเสร็จ ส่วนที่ยังดาวน์โหลดไม่ถึงก็รอ แล้วตามมาเองโดยหน้าต่างไม่ค้าง; ตอน resize จะจัดส่วนที่เห็นก่อน |
+| แสดงผลทีละส่วน | HTML ถูกส่งให้ viewer **ระหว่างดาวน์โหลด** (gzip ก็ถอดทีละส่วน) และ parse ไปพร้อมกัน; เจอ `<link rel=stylesheet>` ก็โหลด CSS ทันที; จัดหน้าจากบนลงล่างครั้งละ ~12 ms ต่อเฟรม จอแรกขึ้นทันทีที่จัดเสร็จ ส่วนที่ยังดาวน์โหลดไม่ถึงก็รอ แล้วตามมาเองโดยหน้าต่างไม่ค้าง; ตอน resize จะจัดส่วนที่เห็นก่อน; **ตารางที่ยังโหลดไม่จบแสดงแถวที่มาแล้วไปก่อน** (จัดใหม่เมื่อมีแถวเพิ่ม: หน้าที่ทั้งหน้าเป็นตาราง เช่น HN บนเน็ตช้า ขึ้นที่ 1 วินาทีแทนที่จะรอโหลดจบ); หน้าที่ยังไม่เจอ `<main>` รอเพื่อตัดสินใจเรื่อง reader view ไม่เกิน 1 วินาที ถ้า `<main>` มาทีหลังและยังไม่ได้เลื่อนหน้า จะสลับเป็น reader view ให้เอง |
 | CSS | อ่าน `<style>` และ `<link rel=stylesheet>` เพื่อหาว่าอะไรถูก**ซ่อน** (`display:none`, `visibility:hidden`, ข้อความสำหรับ screen reader); `@media` ตามความกว้างจอ; cascade (specificity, `!important`); คำนวณ CSS ของแต่ละ element ตอนที่การจัดหน้าไปถึง และใช้ Bloom filter ของ ancestor ตัด selector ที่ไม่มีทางตรงออกเร็ว ๆ |
+| CSS จัดหน้า | **float** ซ้าย/ขวา (ข้อความไหลรอบ, `clear`, รวมถึง `<img align>`/`<table align>` และ `<br clear>` ของเว็บเก่า; ตารางที่อยู่ข้าง float หลบให้); **flex แถว** (`flex-grow/shrink/basis`, `flex-wrap`, `justify-content`, `align-items`, `gap`; แถวที่แน่นเกินจะขึ้นบรรทัดใหม่แทนการบีบเป็นเส้น); flex คอลัมน์จัดแบบ block; **grid** (`grid-template-columns`: px/fr/%/`repeat()`/`auto-fill`/`minmax()`, `grid-column: span`); `width`, `max-width`, `min-width`, `display: block/inline`; carousel/แถบเลื่อน (`overflow: hidden/auto` รอบแถว flex) แสดงเฉพาะชิ้นที่พอดี; flex/grid/float ที่ยังโหลดไม่จบแสดงไปก่อนแบบเดียวกับตาราง |
 | รูป | PNG, JPEG, GIF, **WebP** (lossy, lossless, alpha, animation เฟรมแรก), **SVG** (ไฟล์ `.svg` และ `<svg>` ที่ฝังในหน้า), BMP; `<picture>`/`srcset`; `data:` URI |
 | Reader view | ถ้าเว็บมี `<main>`/`role=main` จะแสดงแค่ส่วนนั้น คลิกป้ายมุมขวาล่างเพื่อสลับไปดูทั้งหน้า |
 | Form | text/password/checkbox/radio/select/textarea/submit, ส่งแบบ GET และ POST |
-| อื่น ๆ | ลิงก์, `#anchor` (รวมถึง URL ที่มี `#` ตั้งแต่เปิด: เลื่อนไปเมื่อจัดหน้าถึง), `<meta refresh>`, scroll (ล้อเมาส์, คีย์บอร์ด, scrollbar) |
+| อื่น ๆ | ลิงก์, `#anchor` (รวมถึง URL ที่มี `#` ตั้งแต่เปิด: เลื่อนไปเมื่อจัดหน้าถึง; ภาษาไทยได้ทั้งแบบตัวอักษรตรง ๆ และแบบ `%E0%B8…`), `<meta refresh>`, scroll (ล้อเมาส์, คีย์บอร์ด, scrollbar), ค้นหาในหน้า (`lw_find`) |
 
-ไม่มี: JavaScript, CSS ส่วนที่เป็นการจัดหน้า (flex, grid, float, position), AVIF
+ไม่มี: JavaScript, CSS `position` (absolute/fixed/sticky วางตามลำดับปกติ), margin/padding/สีพื้นจาก stylesheet (ใช้ได้เฉพาะใน `style=""`), inline-block จริง, AVIF
 (เว็บที่ต้องใช้ JS อย่างผลค้นหาของ Google จึงใช้ไม่ได้ ส่วน DuckDuckGo Lite, Wikipedia, Hacker News, BBC ใช้ได้)
 
 ## เขียนเว็บของตัวเอง
@@ -194,7 +201,7 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 | `lw_pointer` (เมาส์ → คืน cursor) | `lw_text`, `lw_text_width` (ตัวหนา/เอียง/monospace), `lw_line_breaks` |
 | `lw_key`, `lw_char` | `lw_fetch` → ผลกลับมาทาง `lw_on_fetch` / `lw_on_fetch_ex` |
 | `lw_alloc` (ให้ browser ขอหน่วยความจำ) | `lw_open_file` → `lw_on_file`, `lw_save_file`, `lw_clipboard_set/get` |
-| `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (เอกสารแบบ stream), `lw_state`/`lw_restore` (ตำแหน่งที่อ่านอยู่, ไม่บังคับ) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
+| `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (เอกสารแบบ stream), `lw_state`/`lw_restore` (ตำแหน่งที่อ่านอยู่), `lw_find` (ค้นหาในหน้า) (สามตัวหลังไม่บังคับ) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
 
 ## Host จริง
 
@@ -215,7 +222,10 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 
 | คำสั่ง | ทดสอบอะไร |
 |---|---|
-| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/check_css_layout.py` | CSS จัดหน้าจาก stylesheet: หน้ากล่องสี (flex แถว 1:2 + กว้างคงที่ + gap, float ขวา + ข้อความไหลรอบ + clear, grid 3 คอลัมน์, carousel ใน `overflow:hidden`, `justify-content:center`) แล้วหากล่องจากสีในภาพ |
+| `python tests/check_progressive.py` | หน้าที่โหลดช้า (`slow_server.py` บน port ว่าง): ตารางใหญ่แสดงแถวก่อนโหลดจบ, หน้าไม่มี `<main>` ขึ้นจอแรกก่อนโหลดจบ, `<main>` ที่มาช้ายังจบที่ reader view, และภาพสุดท้ายเหมือนโหลดทีเดียว |
+| `python tests/check_edit.py` | ช่องกรอก (พิมพ์, ลูกศร, Home/End, Shift เลือก, Delete/Backspace, ตัด, สระไทย, ดับเบิลคลิก, ลากเลือก, Tab, textarea), `#fragment` ภาษาไทยแบบตรงและแบบ `%`, ค้นหาในหน้า (นับ, ถัดไป/ก่อนหน้า, ตัวพิมพ์, ไม่เจอ, ไฟล์ข้อความ) |
 | `python tests/check_select.py` | เลือก/คัดลอก/วางข้อความ: ทั้งหน้า, ลากเลือก (ข้ามลิงก์), ช่องกรอก (วาง, ตัด, รหัสผ่านคัดลอกไม่ได้), ไฟล์ข้อความ, หน้า error; แถบแท็บ: ส่วนไหนเป็น caption/ปุ่ม/ขอบปรับขนาด, ปุ่มขยายหน้าต่าง |
 | `python tests/check_sleep.py` | แท็บหลับแล้วตื่นมาเหมือนเดิมทุก pixel ที่ตำแหน่งเดิม, back และ reload กลับที่เดิม, หน้าที่พิมพ์ไว้และหน้า Low-web ไม่หลับ |
 | `python tests/check_access.py` | หน้าเว็บเข้าถึงอะไรได้: ระดับของ IP, หน้าเว็บจากอินเทอร์เน็ต/วงแลนเข้า 127.0.0.1, `localhost`, `[::1]` ไม่ได้, redirect ไป `file://`, ของใน cache, ไฟล์นอกโฟลเดอร์ (`..`, `%2e%2e`, `%5c`) |
@@ -233,7 +243,7 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 | `python tests/gen_hpack_huffman.py` | สร้าง `browser/hpack_huffman.h` (ตาราง Huffman ของ HPACK จาก RFC 7541) |
 | `python tests/gen_webp_tables.py` | สร้าง `browser/webp_tables.h` (ตารางค่าคงที่ของ VP8/VP8L จาก spec) |
 | `bin\fetchtest [--exact] [--cache DIR] URL…` | HTTP/HTTPS, redirect, chunked, gzip, ตรวจ certificate, กฎ `index.wasm`; log บอกว่าแต่ละ request มาจาก cache หรือใช้ connection เดิม |
-| `bin\lowweb.exe URL --size 1000x680 --log out.log --script "wait 500; click 100 200; key 83 ctrl" --screenshot out.bmp` | ขับ browser อัตโนมัติแล้วถ่ายภาพหน้าจอ (log บอกเวลานับจากเริ่มโหลด เช่น `[page +383 ms] viewer: first screen…`; คำสั่งรอจะรอให้โหลดเสร็จก่อน ยกเว้นสั่ง `async`; `mem` เขียนการใช้หน่วยความจำลง log; `clip TEXT` ใส่ข้อความใน clipboard ของ script (script mode ไม่แตะ clipboard จริง: ทุกการคัดลอกเขียนเป็น `[clipboard] …` ใน log); `hittest X Y` บอกว่าจุดนั้นบนแถบแท็บเป็นอะไร) |
+| `bin\lowweb.exe URL --size 1000x680 --log out.log --script "wait 500; click 100 200; key 83 ctrl" --screenshot out.bmp` | ขับ browser อัตโนมัติแล้วถ่ายภาพหน้าจอ (log บอกเวลานับจากเริ่มโหลด เช่น `[page +383 ms] viewer: first screen…`; คำสั่งรอจะรอให้โหลดเสร็จก่อน ยกเว้นสั่ง `async` (กลับมารอด้วย `sync`); `mem` เขียนการใช้หน่วยความจำลง log; `clip TEXT` ใส่ข้อความใน clipboard ของ script (script mode ไม่แตะ clipboard จริง: ทุกการคัดลอกเขียนเป็น `[clipboard] …` ใน log); `hittest X Y` บอกว่าจุดนั้นบนแถบแท็บเป็นอะไร; `chars TEXT` พิมพ์ข้อความลงหน้า; `find TEXT` / `findnext` / `findprev` / `findclose` ใช้แถบค้นหา (log `[find] 3/12`)) |
 
 ## ข้อจำกัดที่รู้อยู่
 

@@ -54,6 +54,12 @@
 //         asks before it unloads the page (back/forward, reload; for the viewer also a
 //         background tab put to sleep to save memory) and hands the number back right
 //         after lw_start when the same history entry is loaded again. 0 = nothing to restore.
+//   int   lw_find(const char *text, int len, int how);
+//         optional: find in page, for the browser's find bar (Ctrl+F). how: 0 = look for
+//         text (memory from lw_alloc, the page frees it; len 0 = nothing), starting from
+//         what is in view; 1 / -1 = the next / previous match; 2 = stop (no highlights);
+//         3 = just tell. Returns (current match, from 1) << 16 | number of matches (at
+//         most 65535), or 0 for none. The page shows the matches itself.
 //
 // Documents the browser cannot show itself (HTML) are opened with a built-in viewer page
 // (sites/viewer/viewer.c); it receives the document as fetch id 0, streamed through

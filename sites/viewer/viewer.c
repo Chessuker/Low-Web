@@ -524,6 +524,7 @@ struct Node {
     u8 open;            // element: the parser may still add children (the document is streaming in)
     int ref;            // image or control index, -1
     int y;              // layout: top of the element (for #fragment links)
+    struct Lay *lay;    // element: its CSS layout properties (css.c), 0 if none; valid with css_ep
 };
 
 static Node *root, *head_node;
@@ -1043,6 +1044,7 @@ typedef struct {
 enum { IT_TEXT, IT_RECT, IT_IMAGE, IT_CONTROL };
 typedef struct {
     u8 kind, flags, deco;
+    u8 layer;      // 1: in a float (painted after the rest, as CSS paints floats above blocks)
     short size;
     int x, y, w, h, asc;
     u32 color;
@@ -1071,7 +1073,77 @@ typedef struct {
     int space, brk;
     u8 align;
     int strut;              // empty-line height (for <br><br>)
+    int bfc;                // the float scope (block formatting context) its lines avoid floats of
+    int bx, bw;             // x and w outside the current line, while a float narrows it (adj)
+    u8 adj;
 } Ctx;
+
+// ---- floats -------------------------------------------------------------------------------
+// A float is a box at the left or right of its scope (bfc: the document, a table cell, a
+// flex or grid item, a float's own content); lines in that scope get shorter beside it.
+
+typedef struct { int x0, x1, y0, y1, bfc; u8 right; } FloatBox;  // x0..x1 includes the gap to the text
+static FloatBox *floats;
+static int nfloats, floats_cap, next_bfc;
+
+// The room [*l, *r) inside [l0, r0) beside floats of scope bfc in rows y..y+h; returns
+// the lowest bottom of those floats (where more room may be), or -1 if none is in the way.
+static int float_band(int bfc, int y, int h, int l0, int r0, int *l, int *r) {
+    int next = -1;
+    *l = l0;
+    *r = r0;
+    for (int i = 0; i < nfloats; i++) {
+        FloatBox *f = &floats[i];
+        if (f->bfc != bfc || f->y0 >= y + MAX(h, 1) || f->y1 <= y) continue;
+        if (f->right) { if (f->x0 < *r) *r = f->x0; }
+        else if (f->x1 > *l) *l = f->x1;
+        if (next < 0 || f->y1 < next) next = f->y1;
+    }
+    return next;
+}
+
+static int floats_bottom(int bfc, int side) {  // side: 1 left, 2 right, 3 both
+    int b = 0;
+    for (int i = 0; i < nfloats; i++)
+        if (floats[i].bfc == bfc && (side & (floats[i].right ? 2 : 1)) && floats[i].y1 > b) b = floats[i].y1;
+    return b;
+}
+
+// Before the first thing on a line: make the line fit beside the floats (or move it below
+// them if too little room is left).
+static void line_begin(Ctx *c, int h) {
+    if (c->measure || c->line_items || !nfloats || c->adj) return;
+    int y = c->y + c->margin, l, r;
+    for (int tries = 0; tries < 64; tries++) {
+        int next = float_band(c->bfc, y, h, c->x, c->x + c->w, &l, &r);
+        if (next < 0 || r - l >= MIN(c->w, (int)(60 * S))) break;
+        y = next;  // too narrow: below the float that ends first
+        c->y = y;
+        c->margin = 0;
+    }
+    if (l == c->x && r == c->x + c->w) return;
+    c->bx = c->x;
+    c->bw = c->w;
+    c->adj = 1;
+    c->x = l;
+    c->w = MAX(r - l, 1);
+}
+
+static void line_end(Ctx *c) {
+    if (!c->adj) return;
+    c->x = c->bx;
+    c->w = c->bw;
+    c->adj = 0;
+}
+
+static void clear_floats(Ctx *c, int side) {
+    if (c->measure || !nfloats) return;
+    int b = floats_bottom(c->bfc, side);
+    if (b > c->y + c->margin) {
+        c->y = b;
+        c->margin = 0;
+    }
+}
 
 // list markers: emitted on the first line inside the <li>
 static char marker_text[24];
@@ -1135,7 +1207,7 @@ static void flush_line(Ctx *c) {
         c->lx = 0; c->line_items = 0; c->space = 0; c->brk = 0;
         return;
     }
-    if (!c->line_items) { c->lx = 0; c->space = 0; c->brk = 0; c->line_start = nitems; return; }
+    if (!c->line_items) { c->lx = 0; c->space = 0; c->brk = 0; c->line_start = nitems; line_end(c); return; }
     c->y += c->margin;
     c->margin = 0;
     int asc = 0, desc = 0;
@@ -1156,6 +1228,7 @@ static void flush_line(Ctx *c) {
     if (c->lx > c->max_w) c->max_w = c->lx;
     c->lx = 0; c->line_items = 0; c->space = 0; c->brk = 0;
     c->line_start = nitems;
+    line_end(c);
 }
 
 static void emit_text(Ctx *c, const char *s, int len, int x, int w, const Style *st) {
@@ -1176,16 +1249,19 @@ static void emit_text(Ctx *c, const char *s, int len, int x, int w, const Style 
 
 // Places one unbreakable piece of text; may wrap before it.
 static void place_segment(Ctx *c, const char *s, int len, const Style *st, int can_break) {
+    int lh = ascent(st->size) + descent(st->size);
+    if (!c->line_items) line_begin(c, lh);
     int w = text_w(s, len, st);
     int sw = c->space && c->line_items ? space_w(st) : 0;
     if (c->line_items && (can_break || c->space) && !st->nowrap && c->lx + sw + w > c->w) {
         flush_line(c);
         sw = 0;
     }
-    if (!c->line_items) sw = 0;
+    if (!c->line_items) { sw = 0; line_begin(c, lh); }
     if (w > c->w && !st->nowrap && !c->measure && len > 1) {
         // a single word wider than the line (long URLs): split it between characters
         while (len > 0) {
+            if (!c->line_items) line_begin(c, lh);
             int lo = 1, hi = len, fit = 0;
             while (lo <= hi) {
                 int mid = (lo + hi) / 2;
@@ -1220,6 +1296,7 @@ static void flow_text(Ctx *c, Node *t, const Style *st) {
             while (j < len && s[j] != '\n') j++;
             if (j > i) {
                 // tabs render as spaces through the font; good enough for code
+                if (!c->line_items) line_begin(c, ascent(st->size) + descent(st->size));
                 int w = text_w(s + i, j - i, st);
                 emit_text(c, s + i, j - i, c->lx, w, st);
             }
@@ -1256,9 +1333,10 @@ static void flow_text(Ctx *c, Node *t, const Style *st) {
 
 // Inline box (image, form control).
 static Item *place_box(Ctx *c, int w, int h, int kind, const Style *st) {
+    if (!c->line_items) line_begin(c, h);
     int sw = c->space && c->line_items ? space_w(st) : 0;
     if (c->line_items && c->lx + sw + w > c->w) { flush_line(c); sw = 0; }
-    if (!c->line_items) sw = 0;
+    if (!c->line_items) { sw = 0; line_begin(c, h); }
     int x = c->lx + sw;
     c->lx = x + w;
     c->line_items++;
@@ -1539,6 +1617,8 @@ static void flow_inline_svg(Ctx *c, Node *n, const Style *st) {
     if (it) it->ref = n->ref;
 }
 
+static int pct_max_width(Node *n);  // (after css.c)
+
 static void flow_image(Ctx *c, Node *n, const Style *st) {
     Img *im = &imgs[image_for(n)];
     int pct = 0;
@@ -1575,8 +1655,10 @@ static void flow_image(Ctx *c, Node *n, const Style *st) {
         }
         return;
     }
+    int min_before = c->min_w;
     Item *it = place_box(c, w, h, IT_IMAGE, st);
     if (it) it->ref = n->ref;
+    if (c->measure && pct_max_width(n)) c->min_w = min_before;  // it can be as narrow as the room: it needs none
 }
 
 // ---- form controls --------------------------------------------------------------------
@@ -1594,7 +1676,6 @@ typedef struct {
 } Control;
 static Control *controls;
 static int ncontrols, controls_cap, focus = -1;
-static int focus_all;  // the focused text field's whole value is selected (Ctrl+A)
 #define C_SELECTION RGB(179, 215, 255)
 
 static int text_content(Node *n, char *out, int cap, int k) {
@@ -1934,6 +2015,7 @@ static void block(Node *n, Ctx *c, const Style *st, int mt, int mb, int ml, int 
     sub->measure = c->measure;
     sub->align = st->align;
     sub->line_start = nitems;
+    sub->bfc = c->bfc;
     c->margin = 0;
     if (bg >> 24) {
         if (!c->measure) {
@@ -1999,8 +2081,24 @@ static void measure_cell(Node *cell, Node *row, const Style *st, int *mn, int *m
     *mx = m.max_w;
 }
 
+static void flow_table_at(Node *t, Ctx *c, const Style *st);
+
+// A table beside floats takes the room left there if that is at least half the width,
+// else it goes below them.
 static void flow_table(Node *t, Ctx *c, const Style *st) {
     begin_block(c);
+    if (c->measure || !nfloats) { flow_table_at(t, c, st); return; }
+    int l, r, x = c->x, w = c->w;
+    if (float_band(c->bfc, c->y + c->margin, (int)(20 * S), c->x, c->x + c->w, &l, &r) >= 0) {
+        if (r - l >= c->w / 2) { c->x = l; c->w = r - l; }
+        else clear_floats(c, 3);
+    }
+    flow_table_at(t, c, st);
+    c->x = x;
+    c->w = w;
+}
+
+static void flow_table_at(Node *t, Ctx *c, const Style *st) {
     static Node *rows_buf[4096];
     // rows_buf is shared by nested tables; copy what we need first
     int nrows = table_rows(t, rows_buf, 4096);
@@ -2156,9 +2254,11 @@ static void flow_table(Node *t, Ctx *c, const Style *st) {
             sub.y = y + bw + padding;
             sub.align = cs.align;
             sub.line_start = nitems;
+            sub.bfc = ++next_bfc;
             cell->y = sub.y;
             flow_children(cell, &sub, &cs);
             flush_line(&sub);
+            if (nfloats) sub.y = MAX(sub.y, floats_bottom(sub.bfc, 3));
             int h = sub.y - y + padding + bw;
             row_h = MAX(row_h, h);
             if (c_item >= 0 && cell_count < MAX_COLS) cell_items[cell_count++] = c_item;
@@ -2191,6 +2291,389 @@ static const short heading_margin[6] = {67, 83, 100, 133, 167, 233};
 static u8 layout_pass;  // stamps the nodes each layout reaches (Node.lpass)
 static int flow_wait;   // flow() met an element the parser hasn't finished; try again later
 
+// A table still being parsed would hold up everything after it (the incremental layout
+// only waits at a block, and a table is laid out as a whole: its columns depend on all its
+// rows). So the layout lays it out "provisionally" with what has arrived, shows that, and
+// later goes back to the state before it (prov_*) to lay it out again with more rows, or
+// for good once it is closed. Each redo costs as much as the table so far, so redos come
+// at most every 250 ms and no more often than 4x their own cost apart.
+static int provisional;       // flow(): lay out elements that are still open as they are now
+static int want_provisional;  // flow() met an open table that could be laid out provisionally
+static int prov_active;       // the last thing laid out is provisional
+static int prov_items, prov_links, prov_list, prov_marker, prov_bytes, prov_floats;
+static Ctx prov_sub;
+static double prov_t, prov_cost;
+
+// ---- CSS boxes: floats, flex rows, grids ---------------------------------------------------
+
+static Node *no_float;  // the element whose own float is being laid out (its content isn't floated again)
+static Node *main_node;  // (below: what reader view shows)
+
+static int len_px(const Lay *l, int prop, int em, int of, int def) {
+    if (!l || !l->has[prop]) return def;
+    long long v = l->val[prop];
+    switch (l->unit[prop]) {
+    case U_PX: case U_NUM: return (int)(v * S / 100);
+    case U_EM: return (int)(v * em / 100);
+    case U_REM: return (int)(v * 16 * S / 100);
+    case U_PCT: return of < 0 ? def : (int)(of * v / 10000);  // of < 0: measuring (a percentage of nothing yet)
+    case U_VW: return (int)(W * v / 10000);
+    }
+    return def;
+}
+
+// What box n makes, from its CSS (and the old align attribute of images and tables).
+enum { BOX_NORMAL, BOX_FLOAT_LEFT, BOX_FLOAT_RIGHT, BOX_FLEX_ROW, BOX_GRID };
+static int grid_tracks(const char *t, int w, int gap, int em, int *px, int *fr, int max);
+
+static int box_kind(Node *n, const Ctx *c, int em) {
+    const Lay *l = n->lay;  // (display, float: lay_items only for flex and grid)
+    int fl = l && l->has[LP_FLOAT] ? l->val[LP_FLOAT] : 0;
+    if (!fl && (n->tag == T_IMG || n->tag == T_TABLE)) {
+        const char *a = attr(n, "align");
+        if (a) fl = ieq(a, "left") ? 2 : ieq(a, "right") ? 3 : 0;
+    }
+    if ((fl == 2 || fl == 3) && n != no_float && n != main_node && n->tag != T_BODY && n->tag != T_HTML) return fl == 2 ? BOX_FLOAT_LEFT : BOX_FLOAT_RIGHT;
+    if (!l) return BOX_NORMAL;
+    if (l->disp == LD_FLEX || l->disp == LD_GRID) l = lay_items(n);
+    if (l->disp == LD_FLEX && !(l->has[LP_DIR] && l->val[LP_DIR] == 2)) return BOX_FLEX_ROW;
+    if (l->disp == LD_GRID && l->has[LP_COLS]) {
+        int px[24], fr[24];
+        int gap = len_px(l, LP_CGAP, em, c->w, 0);
+        if (grid_tracks((const char *)(unsigned long)l->val[LP_COLS], c->w, gap, em, px, fr, 24) > 1) return BOX_GRID;
+    }
+    return BOX_NORMAL;
+}
+
+static int pct_max_width(Node *n) {  // width or max-width in %: its min-content size counts as 0
+    const Lay *l = lay_items(n);
+    return l && ((l->has[LP_MAXW] && l->unit[LP_MAXW] == U_PCT) || (l->has[LP_WIDTH] && l->unit[LP_WIDTH] == U_PCT));
+}
+
+static void measure_node(Node *k, const Style *st, int *mn, int *mx) {
+    Ctx m;
+    __builtin_memset(&m, 0, sizeof m);
+    m.w = 1 << 24;
+    m.measure = 1;
+    flow(k, &m, st);
+    flush_line(&m);
+    *mn = m.min_w;
+    *mx = m.max_w;
+}
+
+// Lays out k alone in a box at (x, y), w wide, as its own float scope. Returns its height;
+// *from is where its items start.
+static int flow_box(Node *k, int x, int y, int w, const Style *st, int *from) {
+    Ctx sub;
+    __builtin_memset(&sub, 0, sizeof sub);
+    sub.x = x;
+    sub.w = MAX(w, 1);
+    sub.y = y;
+    sub.align = st->align;
+    sub.line_start = nitems;
+    sub.bfc = ++next_bfc;
+    *from = nitems;
+    Node *nf = no_float;
+    no_float = k;
+    flow(k, &sub, st);
+    no_float = nf;
+    flush_line(&sub);
+    int bottom = sub.y + sub.margin;
+    if (nfloats) bottom = MAX(bottom, floats_bottom(sub.bfc, 3));
+    return bottom - y;
+}
+
+static void flow_float(Node *n, Ctx *c, const Style *st, int right) {
+    if (c->line_items) flush_line(c);  // (a float in the middle of a line goes below it)
+    int avail = c->w, em = st->size;
+    const Lay *l = lay_items(n);
+    int w = len_px(l, LP_WIDTH, em, avail, -1);
+    if (w <= 0) {  // as wide as its content wants, within the room there is
+        int mn, mx;
+        measure_node(n, st, &mn, &mx);
+        w = MAX(MIN(mx, avail), mn);
+    }
+    int maxw = len_px(l, LP_MAXW, em, avail, -1);
+    if (maxw > 0 && w > maxw) w = maxw;
+    if (w > avail) w = avail;
+    if (w < 1) w = 1;
+    int gap = (int)(12 * S), y = c->y + c->margin, lft, rgt;
+    for (int tries = 0; tries < 64; tries++) {  // as high as it fits beside earlier floats
+        int next = float_band(c->bfc, y, 1, c->x, c->x + c->w, &lft, &rgt);
+        if (next < 0 || rgt - lft >= w) break;
+        y = next;
+    }
+    int x = right ? rgt - w : lft, from;
+    int h = flow_box(n, x, y, w, st, &from);
+    for (int i = from; i < nitems; i++) items[i].layer = 1;
+    floats = (FloatBox *)grow_array(floats, nfloats, &floats_cap, sizeof(FloatBox));
+    FloatBox *f = &floats[nfloats++];
+    f->x0 = right ? x - gap : x;
+    f->x1 = right ? x + w : x + w + gap;
+    f->y0 = y;
+    f->y1 = y + h + (int)(6 * S);
+    f->bfc = c->bfc;
+    f->right = (u8)right;
+    n->y = y;
+    c->line_start = nitems;  // the float's items are not part of the line that comes next
+}
+
+// The boxes of a flex container or grid: element children, and runs of text (anonymous items).
+static int box_children(Node *n, Node **out, int max) {
+    int k = 0;
+    for (Node *ch = n->first; ch && k < max; ch = ch->next) {
+        if (ch->type == N_TEXT) {
+            int ws = 1;
+            for (u32 i = 0; i < ch->len && ws; i++) ws = ch->text[i] == ' ';
+            if (!ws) out[k++] = ch;
+        } else if (ch->type == N_ELEM && !((tag_flags[ch->tag] & FS) && ch->tag != T_SVG) && !is_hidden(ch)) {
+            out[k++] = ch;
+        }
+    }
+    return k;
+}
+
+static void stretch_and_align(int from, int to, int top, int line_h, int h, int align) {
+    int dy = align == 3 ? (line_h - h) / 2 : align == 4 ? line_h - h : 0;
+    if (dy > 0)
+        for (int i = from; i < to; i++) items[i].y += dy;
+    else if (align <= 1 && from < to && items[from].kind == IT_RECT && items[from].y >= top && items[from].y < top + line_h)
+        items[from].h = top + line_h - items[from].y;  // stretch: its background reaches the bottom of the line
+}
+
+#define MAX_BOXES 256
+
+// A row whose box (or the one or two around it) clips what sticks out sideways (overflow:
+// hidden, auto, scroll): a carousel or a strip that scrolls. Only what fits is shown.
+static int clips_x(Node *n) {
+    for (int up = 0; n && n->type == N_ELEM && up < 3; up++, n = n->parent) {
+        const Lay *l = lay_items(n);
+        if (l && l->has[LP_OVER] && l->val[LP_OVER] == 2) return 1;
+    }
+    return 0;
+}
+
+// display: flex, in a row (flex-direction: row; columns are laid out as blocks).
+static void flow_flex_row(Node *n, Ctx *c, const Style *st) {
+    begin_block(c);
+    const Lay *l = lay_items(n);
+    int em = st->size, W = c->measure ? -1 : c->w;  // (measuring: percentages count as auto)
+    static Node *buf[MAX_BOXES];
+    Node **kids = (Node **)must_alloc(MAX_BOXES * sizeof(Node *));
+    int nk = box_children(n, buf, MAX_BOXES);
+    __builtin_memcpy(kids, buf, (u32)nk * sizeof(Node *));
+    int gap = len_px(l, LP_CGAP, em, W, 0), rgap = len_px(l, LP_RGAP, em, W, 0);
+    int wrap = l && l->has[LP_WRAP] && l->val[LP_WRAP] == 2;
+    int justify = l && l->has[LP_JUSTIFY] ? l->val[LP_JUSTIFY] : 1, align = l && l->has[LP_ALIGN] ? l->val[LP_ALIGN] : 1;
+    int *basis = (int *)must_alloc((u32)(nk + 1) * 4 * 8), *mins = basis + nk + 1, *grow = mins + nk + 1, *shrink = grow + nk + 1,
+        *width = shrink + nk + 1, *from = width + nk + 1, *hs = from + nk + 1, *to = hs + nk + 1;  // (not on the stack: flex nests)
+    for (int i = 0; i < nk; i++) {
+        const Lay *kl = lay_items(kids[i]);
+        int mn, mx;
+        measure_node(kids[i], st, &mn, &mx);
+        int b = len_px(kl, LP_BASIS, em, W, -1);
+        if (b < 0) b = len_px(kl, LP_WIDTH, em, W, -1);
+        if (b < 0) b = mx;
+        int maxw = len_px(kl, LP_MAXW, em, W, -1);
+        if (maxw > 0 && b > maxw) b = maxw;
+        basis[i] = b;
+        mins[i] = MAX(MIN(mn, b > 0 && kl && kl->has[LP_WIDTH] ? b : mn), len_px(kl, LP_MINW, em, W, 0));
+        grow[i] = kl && kl->has[LP_GROW] ? kl->val[LP_GROW] : 0;
+        shrink[i] = kl && kl->has[LP_SHRINK] ? kl->val[LP_SHRINK] : 100;
+    }
+    if (c->measure) {
+        int sum = 0, summin = 0, maxmin = 0;
+        for (int i = 0; i < nk; i++) { sum += basis[i]; summin += mins[i]; maxmin = MAX(maxmin, mins[i]); }
+        if (nk) { sum += gap * (nk - 1); summin += gap * (nk - 1); }
+        c->max_w = MAX(c->max_w, sum);
+        c->min_w = MAX(c->min_w, wrap || clips_x(n) ? maxmin : summin);  // (clipped: one item at a time)
+        mem_free(basis);
+        mem_free(kids);
+        return;
+    }
+    int clip = !wrap && !c->measure && clips_x(n);
+    if (!wrap && !clip) {  // a row with too little room for its items wraps (rather than squeeze them to slivers)
+        int need = gap * (nk > 0 ? nk - 1 : 0);
+        for (int k = 0; k < nk; k++) need += MAX(mins[k], MIN(basis[k], (int)(100 * S)));
+        if (need > W) wrap = 1;
+    }
+    c->y += c->margin;
+    c->margin = 0;
+    n->y = c->y;
+    int y = c->y, i = 0;
+    while (i < nk) {
+        int j = i, sum = 0;  // one line: i..j
+        while (j < nk) {
+            int add = basis[j] + (j > i ? gap : 0);
+            if (wrap && j > i && sum + add > W) break;
+            sum += add;
+            j++;
+        }
+        int free = W - sum, tgrow = 0;
+        long long tshrink = 0;
+        for (int k = i; k < j; k++) { tgrow += grow[k]; tshrink += (long long)shrink[k] * basis[k]; }
+        for (int k = i; k < j; k++) {
+            int w = basis[k];
+            if (free > 0 && tgrow > 0) w += (int)((long long)free * grow[k] / tgrow);
+            else if (free < 0 && tshrink > 0 && !clip) w -= (int)((long long)(-free) * shrink[k] * basis[k] / tshrink);
+            width[k] = MAX(w, mins[k]);
+            if (clip && width[k] > W) width[k] = W;
+        }
+        int used = gap * (j - i - 1), extra = 0;
+        for (int k = i; k < j; k++) used += width[k];
+        int left = W - used, x = c->x, between = gap;
+        if (left > 0 && !(free > 0 && tgrow > 0)) {
+            int cnt = j - i;
+            if (justify == 2) x += left / 2;
+            else if (justify == 3) x += left;
+            else if (justify == 4 && cnt > 1) between += left / (cnt - 1);
+            else if (justify == 5) { extra = left / cnt; x += extra / 2; between += extra; }
+            else if (justify == 6) { extra = left / (cnt + 1); x += extra; between += extra; }
+        }
+        int line_h = 0;
+        for (int k = i; k < j; k++) {
+            if (clip && k > i && x + width[k] > c->x + W) { j = k; break; }  // clipped away: the rest isn't shown
+            hs[k - i] = flow_box(kids[k], x, y, width[k], st, &from[k - i]);
+            to[k - i] = nitems;
+            line_h = MAX(line_h, hs[k - i]);
+            x += width[k] + between;
+        }
+        for (int k = i; k < j; k++) stretch_and_align(from[k - i], to[k - i], y, line_h, hs[k - i], align);
+        y += line_h + (j < nk ? rgap : 0);
+        i = clip ? nk : j;
+    }
+    c->y = y;
+    c->max_w = MAX(c->max_w, W);
+    c->line_start = nitems;
+    c->lx = 0; c->line_items = 0; c->space = 0; c->brk = 0;
+    mem_free(basis);
+    mem_free(kids);
+}
+
+// grid-template-columns, for a grid `w` wide: each track's fixed size (px) or fr share (x100).
+// repeat(n, ...), repeat(auto-fill | auto-fit, ...), minmax(), fr, px/em/rem/%, auto.
+static int grid_tracks(const char *t, int w, int gap, int em, int *px, int *fr, int max) {
+    int n = 0;
+    while (*t && n < max) {
+        while (*t == ' ' || *t == ',') t++;
+        if (!*t) break;
+        if (*t == '[') { while (*t && *t != ']') t++; if (*t) t++; continue; }  // line names
+        const char *e = t;
+        int depth = 0;
+        while (*e && !(depth == 0 && *e == ' ')) { if (*e == '(') depth++; if (*e == ')') depth--; e++; }
+        if (iprefix(t, (int)(e - t), "repeat(")) {
+            const char *a = t + 7, *comma = a;
+            while (comma < e && *comma != ',') comma++;
+            const char *inner = comma + 1, *ie = e - 1;  // without the final ")"
+            int auto_fill = iprefix(a, (int)(comma - a), "auto-f");
+            int count = auto_fill ? 0 : parse_int(a, 0);
+            char one[160];
+            int ol = MIN((int)(ie - inner), 159);
+            __builtin_memcpy(one, inner, (u32)ol);
+            one[ol] = 0;
+            int tpx[24], tfr[24];
+            int tn = grid_tracks(one, w, gap, em, tpx, tfr, 24);
+            if (tn <= 0) { t = e; continue; }
+            if (auto_fill) {  // as many as fit, each at its minimum (the px part)
+                int size = 0;
+                for (int i = 0; i < tn; i++) size += MAX(tpx[i], (int)(20 * S)) + gap;
+                count = MAX(1, (w + gap) / MAX(size, 1));
+            }
+            for (int r = 0; r < MAX(count, 1) && n < max; r++)
+                for (int i = 0; i < tn && n < max; i++) { px[n] = tpx[i]; fr[n] = tfr[i]; n++; }
+            t = e;
+            continue;
+        }
+        Lay one;
+        __builtin_memset(&one, 0, sizeof one);
+        int val;
+        u8 unit;
+        const char *q = t;
+        if (iprefix(t, (int)(e - t), "minmax(")) {  // minmax(a, b): b if it is a share, else fixed b
+            q = t + 7;
+            read_len(&q, e, &val, &unit);
+            one.has[0] = 1; one.val[0] = val; one.unit[0] = unit;
+            int lo = unit == U_AUTO ? 0 : len_px(&one, 0, em, w, 0);
+            while (q < e && (*q == ',' || *q == ' ')) q++;
+            const char *b = q;
+            if (read_len(&q, e, &val, &unit) && (unit == U_NUM || iprefix(b, (int)(e - b), "auto"))) {
+                px[n] = lo; fr[n] = unit == U_NUM ? MAX(val, 1) : 100;
+            } else {
+                one.val[0] = val; one.unit[0] = unit;
+                px[n] = MAX(lo, len_px(&one, 0, em, w, lo)); fr[n] = 0;
+            }
+        } else if (read_len(&q, e, &val, &unit) && unit != U_AUTO) {
+            if (unit == U_NUM && val > 0 && iprefix(q - 2, 2, "fr")) { px[n] = 0; fr[n] = val; }
+            else { one.has[0] = 1; one.val[0] = val; one.unit[0] = unit; px[n] = len_px(&one, 0, em, w, 0); fr[n] = 0; }
+        } else {  // auto, min-content, fit-content(): a share of what is left
+            px[n] = 0; fr[n] = 100;
+        }
+        n++;
+        t = e;
+    }
+    return n;
+}
+
+static void flow_grid(Node *n, Ctx *c, const Style *st) {
+    begin_block(c);
+    const Lay *l = lay_items(n);
+    int em = st->size, W = c->measure ? -1 : c->w;
+    int cgap = len_px(l, LP_CGAP, em, W, 0), rgap = len_px(l, LP_RGAP, em, W, 0);
+    int px[24], fr[24], cw[24];
+    int nc = grid_tracks((const char *)(unsigned long)l->val[LP_COLS], W, cgap, em, px, fr, 24);
+    static Node *buf[MAX_BOXES];
+    Node **kids = (Node **)must_alloc(MAX_BOXES * sizeof(Node *));
+    int nk = box_children(n, buf, MAX_BOXES);
+    __builtin_memcpy(kids, buf, (u32)nk * sizeof(Node *));
+    if (c->measure) {
+        int mxw = 0, mnw = 0;
+        for (int i = 0; i < nk; i++) {
+            int mn, mx;
+            measure_node(kids[i], st, &mn, &mx);
+            mxw = MAX(mxw, mx);
+            mnw = MAX(mnw, mn);
+        }
+        c->max_w = MAX(c->max_w, nc * mxw + (nc - 1) * cgap);
+        c->min_w = MAX(c->min_w, mnw);
+        mem_free(kids);
+        return;
+    }
+    int fixed = cgap * (nc - 1), tfr = 0;
+    for (int i = 0; i < nc; i++) { fixed += px[i]; tfr += fr[i]; }
+    int rest = W - fixed;
+    for (int i = 0; i < nc; i++) cw[i] = px[i] + (fr[i] && tfr && rest > 0 ? (int)((long long)rest * fr[i] / tfr) : 0);
+    c->y += c->margin;
+    c->margin = 0;
+    n->y = c->y;
+    int y = c->y, k = 0;
+    while (k < nk) {
+        int col = 0, line_h = 0, cnt = 0, from[24], hs[24], to[24];
+        while (k < nk && col < nc) {
+            const Lay *kl = lay_items(kids[k]);
+            int span = kl && kl->has[LP_SPAN] ? kl->val[LP_SPAN] : 1;
+            if (span < 0 || span > nc) span = nc;
+            if (col > 0 && col + span > nc) break;  // doesn't fit in this row
+            int x = c->x, w = cgap * (span - 1);
+            for (int i = 0; i < col; i++) x += cw[i] + cgap;
+            for (int i = col; i < col + span && i < nc; i++) w += cw[i];
+            hs[cnt] = flow_box(kids[k], x, y, w, st, &from[cnt]);
+            to[cnt] = nitems;
+            line_h = MAX(line_h, hs[cnt]);
+            cnt++;
+            col += span;
+            k++;
+        }
+        int align = l->has[LP_ALIGN] ? l->val[LP_ALIGN] : 1;
+        for (int i = 0; i < cnt; i++) stretch_and_align(from[i], to[i], y, line_h, hs[i], align);
+        y += line_h + (k < nk ? rgap : 0);
+    }
+    c->y = y;
+    c->max_w = MAX(c->max_w, W);
+    c->line_start = nitems;
+    c->lx = 0; c->line_items = 0; c->space = 0; c->brk = 0;
+    mem_free(kids);
+}
+
 static void flow(Node *n, Ctx *c, const Style *parent) {
     int defer = defer_block;  // only a block that is n itself may be deferred, not its descendants
     defer_block = 0;
@@ -2204,14 +2687,36 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
     int em = st.size;
     n->y = c->y + c->margin;
     n->lpass = layout_pass;
-    if (n->open) {  // still being parsed: only a block can start now (its children follow later)
+    int kind = box_kind(n, c, st.size);
+    if (n->open && !provisional) {  // still being parsed: only a block can start now (its children follow later)
         int blocky = (tag_flags[tag] & FB) && tag != T_HR && tag != T_TABLE && tag != T_IMG && tag != T_SVG &&
-                     tag != T_INPUT && tag != T_BUTTON && tag != T_SELECT && tag != T_TEXTAREA && tag != T_BR;
+                     tag != T_INPUT && tag != T_BUTTON && tag != T_SELECT && tag != T_TEXTAREA && tag != T_BR && kind == BOX_NORMAL;
         if (!defer || !blocky || nframes >= MAX_FRAMES) {
+            if (defer && (tag == T_TABLE || kind != BOX_NORMAL) && !c->measure) want_provisional = 1;
             flow_wait = 1;
             return;
         }
     }
+    const Lay *lay = n->lay;
+    if (lay && lay->has[LP_CLEAR] && lay->val[LP_CLEAR] > 1) {
+        begin_block(c);
+        clear_floats(c, lay->val[LP_CLEAR] == 2 ? 1 : lay->val[LP_CLEAR] == 3 ? 2 : 3);
+    }
+    if (kind == BOX_FLOAT_LEFT || kind == BOX_FLOAT_RIGHT) {
+        if (c->measure) {  // measured as a block of its own
+            Node *nf = no_float;
+            no_float = n;
+            begin_block(c);
+            flow(n, c, &st);
+            begin_block(c);
+            no_float = nf;
+            return;
+        }
+        flow_float(n, c, &st, kind == BOX_FLOAT_RIGHT);
+        return;
+    }
+    if (kind == BOX_FLEX_ROW) { inline_style(n, &st, 0); flow_flex_row(n, c, &st); return; }
+    if (kind == BOX_GRID) { inline_style(n, &st, 0); flow_grid(n, c, &st); return; }
 
     switch (tag) {
     case T_A: {
@@ -2258,6 +2763,7 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
         break;
     }
     case T_BR:
+        if (attr(n, "clear")) { flush_line(c); clear_floats(c, 3); }
         if (c->line_items) flush_line(c);
         else if (!c->measure) { c->y += c->margin + st.size * 134 / 100; c->margin = 0; }
         return;
@@ -2292,6 +2798,9 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
     }
 
     int block_like = (tag_flags[tag] & FB) != 0;
+    if (lay && (lay->disp == LD_INLINE || lay->disp == LD_INLINE_BLOCK) && tag != T_TD && tag != T_TH && tag != T_TR) block_like = 0;
+    else if (lay && (lay->disp == LD_BLOCK || lay->disp == LD_FLEX || lay->disp == LD_GRID)) block_like = 1;
+    if (lay && lay->disp == LD_FLEX && block_like && (lay = lay_items(n))->has[LP_ALIGN] && lay->val[LP_ALIGN] == 3) st.align = 1;  // a centred column
     if (!block_like) {  // inline element
         inline_style(n, &st, 0);
         if (tag == T_Q) {
@@ -2430,6 +2939,9 @@ static void layout_start(void) {
     list_depth = 0;
     marker_pending = 0;
     layout_pass = (u8)(layout_pass % 255 + 1);
+    prov_active = want_provisional = 0;
+    nfloats = 0;
+    next_bfc = 1;
     int pad = (int)(16 * S);
     content_w = MIN(W - 2 * pad - (int)(10 * S), (int)(1100 * S));
     if (content_w < (int)(100 * S)) content_w = MAX(W - 2 * pad, 50);
@@ -2463,11 +2975,40 @@ static int layout_step(double deadline, int need_y) {
         Frame *f = &frames[nframes - 1];
         Node *k = f->single ? (f->last ? 0 : f->single) : f->last ? f->last->next : f->n ? f->n->first : 0;
         if (k) {
+            if (prov_active) {  // k was laid out provisionally: again, once it has grown (or closed)
+                int bytes = parse_dropped + parse_pos;
+                if (k->open && (bytes == prov_bytes || lw_now() - prov_t < MAX(250.0, 4 * prov_cost))) break;
+                nitems = prov_items;
+                nlinks = prov_links;
+                list_depth = prov_list;
+                marker_pending = prov_marker;
+                nfloats = prov_floats;
+                f->sub = prov_sub;
+                prov_active = 0;
+            }
             defer_block = 1;
             flow(k, &f->sub, &f->st);
             defer_block = 0;
             if (flow_wait) {  // wait for the parser
                 flow_wait = 0;
+                if (want_provisional) {  // an open table: lay out what there is of it meanwhile
+                    want_provisional = 0;
+                    prov_items = nitems;
+                    prov_links = nlinks;
+                    prov_list = list_depth;
+                    prov_marker = marker_pending;
+                    prov_floats = nfloats;
+                    prov_sub = f->sub;
+                    prov_bytes = parse_dropped + parse_pos;
+                    double t1 = lw_now();
+                    provisional = 1;
+                    flow(k, &f->sub, &f->st);
+                    provisional = 0;
+                    flow_wait = 0;
+                    prov_t = lw_now();
+                    prov_cost = prov_t - t1;
+                    prov_active = 1;
+                }
                 break;
             }
             f->last = k;
@@ -2476,7 +3017,7 @@ static int layout_step(double deadline, int need_y) {
             break;  // more children may still arrive
         } else if (nframes == 1) {
             flush_line(&f->sub);
-            doc_h = f->sub.y + f->sub.margin + pad;
+            doc_h = MAX(f->sub.y + f->sub.margin, nfloats ? floats_bottom(0, 3) : 0) + pad;
             nframes = 0;
         } else {
             nframes--;
@@ -2596,6 +3137,240 @@ static void draw_text_item(Item *it, int y, int hovered) {
     if (it->deco & 2) fill(it->x, y + it->asc - it->size * 30 / 100, it->w, MAX(1, (int)S), it->color);
 }
 
+// ---- editing text fields ------------------------------------------------------------
+// The focused field has a caret and a selection: byte offsets into its value, from fanchor
+// to fcaret. A one-line field scrolls sideways to keep the caret in view; a textarea wraps
+// its lines and scrolls down. Keys: arrows (by character, Ctrl: by word; Shift selects),
+// Home/End, Backspace/Delete, Ctrl+A/C/X/V, Enter (a new line in a textarea), Tab to the
+// next field. The mouse places the caret, drags a selection, double-clicks a word.
+
+static int fcaret, fanchor;  // in the focused control's value
+static int fsx, fsy;         // its scroll: pixels sideways (one line), lines down (textarea)
+static int fwant_x = -1;     // textarea: the x that Up/Down keep to
+static int field_drag;       // the mouse is selecting in the focused field
+static double field_click_t;
+static int field_clicks, field_click_x, field_click_y;
+
+static int is_mark(const u8 *p);
+static int fsize(void) { return (int)(14 * S); }
+static int fw(const char *s, int len) { return len > 0 ? lw_text_width(s, len, fsize(), 0) : 0; }
+static int is_text_field(const Control *k) { return k->kind == K_TEXT || k->kind == K_PASSWORD || k->kind == K_TEXTAREA; }
+
+// What a field shows: its value, or a dot for each character of a password.
+static char fdots[12288];
+static const char *field_shown(const Control *k, int *len) {
+    if (k->kind != K_PASSWORD) { *len = k->vlen; return k->value; }
+    int n = 0;
+    for (int i = 0; i < k->vlen && n + 3 <= (int)sizeof fdots; i++)
+        if ((k->value[i] & 0xC0) != 0x80) { fdots[n++] = (char)0xE2; fdots[n++] = (char)0x80; fdots[n++] = (char)0xA2; }
+    *len = n;
+    return fdots;
+}
+
+static int shown_off(const Control *k, int off) {  // an offset in the value -> in what is shown
+    if (k->kind != K_PASSWORD) return off;
+    int n = 0;
+    for (int i = 0; i < off && i < k->vlen; i++) n += (k->value[i] & 0xC0) != 0x80;
+    return n * 3;
+}
+
+static int value_off(const Control *k, int shown) {  // and back
+    if (k->kind != K_PASSWORD) return shown;
+    int cps = shown / 3, i = 0;
+    while (i < k->vlen && cps > 0) {
+        i++;
+        while (i < k->vlen && (k->value[i] & 0xC0) == 0x80) i++;
+        cps--;
+    }
+    return i;
+}
+
+// Character boundaries (a Thai vowel or tone mark goes with the letter before it).
+static int next_char(const char *v, int len, int i) {
+    if (i >= len) return len;
+    i += utf8_len((u8)v[i]);
+    while (i < len && len - i >= 2 && is_mark((const u8 *)v + i)) i += utf8_len((u8)v[i]);
+    return i > len ? len : i;
+}
+
+static int prev_char(const char *v, int i) {
+    if (i <= 0) return 0;
+    do {
+        i--;
+        while (i > 0 && (v[i] & 0xC0) == 0x80) i--;
+    } while (i > 0 && is_mark((const u8 *)v + i));
+    return i;
+}
+
+static int prev_cp(const char *v, int i) {  // Backspace takes one code point (a mark on its own)
+    if (i <= 0) return 0;
+    i--;
+    while (i > 0 && (v[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+
+static int word_byte(char c) { return c != ' ' && c != '\n' && c != '\t'; }
+static int next_word(const char *v, int len, int i) {
+    while (i < len && !word_byte(v[i])) i++;
+    while (i < len && word_byte(v[i])) i++;
+    return i;
+}
+static int prev_word(const char *v, int i) {
+    while (i > 0 && !word_byte(v[i - 1])) i--;
+    while (i > 0 && word_byte(v[i - 1])) i--;
+    return i;
+}
+
+// The last character boundary b of s[0..len] whose text s[0..b] is at most x wide.
+static int fit_boundary(const char *s, int len, int x) {
+    if (x < 0) return 0;
+    int lo = 0, hi = len;
+    while (lo < hi) {
+        int mid = lo + (hi - lo + 1) / 2;
+        while (mid < hi && ((s[mid] & 0xC0) == 0x80 || is_mark((const u8 *)s + mid))) mid++;
+        if (fw(s, mid) <= x) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+            while (hi > lo && ((s[hi] & 0xC0) == 0x80 || is_mark((const u8 *)s + hi))) hi--;
+        }
+    }
+    return lo;
+}
+
+static int nearest_boundary(const char *s, int len, int x) {
+    if (x <= 0) return 0;
+    int b = fit_boundary(s, len, x), nb = next_char(s, len, b);
+    if (nb > b && x - fw(s, b) > fw(s, nb) - x) b = nb;
+    return b;
+}
+
+// A textarea's lines: paragraphs wrapped at spaces (or anywhere in a long word).
+#define MAX_FLINES 800
+static int fl_start[MAX_FLINES], fl_len[MAX_FLINES], fl_n;
+
+static void field_lines(const Control *k, int w) {
+    const char *v = k->value;
+    int p = 0;
+    fl_n = 0;
+    for (;;) {
+        int e = p;
+        while (e < k->vlen && v[e] != '\n') e++;
+        int q = p;
+        do {
+            int take = e - q;
+            if (take && fw(v + q, take) > w) {
+                int fit = fit_boundary(v + q, take, w), sp = 0;
+                for (int i = 1; i <= fit; i++)
+                    if (v[q + i - 1] == ' ') sp = i;
+                take = sp ? sp : fit ? fit : next_char(v + q, take, 0);
+            }
+            if (fl_n < MAX_FLINES) {
+                fl_start[fl_n] = q;
+                fl_len[fl_n] = take;
+                fl_n++;
+            }
+            q += take;
+        } while (q < e);
+        if (e >= k->vlen) break;
+        p = e + 1;
+    }
+}
+
+static int caret_line(int off) {
+    int l = 0;
+    while (l + 1 < fl_n && fl_start[l + 1] <= off) l++;
+    return l;
+}
+
+static Item *control_item(int ref) {
+    for (int i = 0; i < draw_limit; i++)
+        if (items[i].kind == IT_CONTROL && items[i].ref == ref) return &items[i];
+    return 0;
+}
+
+static int field_inner_w(const Item *it) { return it ? it->w - (int)(12 * S) : (int)(300 * S); }
+static int field_line_h(void) { return (int)(18 * S); }
+
+// The value offset under view point (x, y) in the field (laid out as `it`).
+static int field_pos_at(Control *k, Item *it, int x, int y) {
+    int tx = it->x + (int)(6 * S);
+    if (k->kind == K_TEXTAREA) {
+        field_lines(k, field_inner_w(it));
+        int top = it->y - scroll_y + (int)(4 * S), dy = y - top;
+        int l = (it->ref == focus ? fsy : 0) + (dy < 0 ? -1 : dy / field_line_h());
+        if (l < 0) l = 0;
+        if (l >= fl_n) l = fl_n - 1;
+        return fl_start[l] + nearest_boundary(k->value + fl_start[l], fl_len[l], x - tx);
+    }
+    int len;
+    const char *sh = field_shown(k, &len);
+    return value_off(k, nearest_boundary(sh, len, x - tx + (it->ref == focus ? fsx : 0)));
+}
+
+static void draw_field(Item *it, int y, Control *k) {
+    int focused = it->ref == focus, b = MAX(1, (int)S), size = fsize();
+    u32 border = focused ? RGB(26, 115, 232) : RGB(118, 118, 118);
+    fill(it->x, y, it->w, it->h, RGB(255, 255, 255));
+    frame_rect(it->x, y, it->w, it->h, focused ? 2 * b : b, border);
+    int tx = it->x + (int)(6 * S), iw = field_inner_w(it), th = ascent(size) + descent(size);
+    if (focused) {
+        if (fcaret > k->vlen) fcaret = k->vlen;
+        if (fanchor > k->vlen) fanchor = k->vlen;
+    }
+    int s0 = focused ? MIN(fcaret, fanchor) : 0, s1 = focused ? MAX(fcaret, fanchor) : 0;
+    int blink = focused && ((int)((lw_now() - caret_t) / 530) & 1) == 0;
+    if (!k->vlen && !focused) {
+        const char *ph = attr(k->node, "placeholder");
+        int ty = k->kind == K_TEXTAREA ? y + (int)(4 * S) : y + (it->h - th) / 2;
+        if (ph) lw_text(fb, W, H, tx, ty, ph, lw_strlen(ph), size, 0, RGB(150, 150, 150));
+        return;
+    }
+    if (k->kind == K_TEXTAREA) {
+        field_lines(k, iw);
+        int lh = field_line_h(), rows = MAX(1, (it->h - (int)(8 * S)) / lh);
+        if (focused) {
+            int cl = caret_line(fcaret);
+            if (cl < fsy) fsy = cl;
+            if (cl >= fsy + rows) fsy = cl - rows + 1;
+        }
+        int first = focused ? fsy : 0;
+        for (int l = first; l < fl_n && l < first + rows; l++) {
+            int ly = y + (int)(4 * S) + (l - first) * lh, st = fl_start[l], len = fl_len[l];
+            const char *v = k->value + st;
+            int a = MAX(s0, st), e = MIN(s1, st + len);
+            if (s1 > s0 && (a < e || (s1 > st + len && s0 <= st + len))) {
+                int x0 = fw(v, a - st), x1 = fw(v, e - st) + (s1 > st + len ? (int)(4 * S) : 0);
+                fill(tx + x0, ly, MIN(x1, iw) - x0, th, C_SELECTION);
+            }
+            int shown = len;
+            while (shown > 0 && v[shown - 1] == '\n') shown--;
+            lw_text(fb, W, H, tx, ly, v, shown, size, 0, C_TEXT);
+            if (blink && l == caret_line(fcaret)) fill(tx + fw(v, fcaret - st), ly, MAX(1, (int)S), th, C_TEXT);
+        }
+        return;
+    }
+    int len, ty = y + (it->h - th) / 2;
+    const char *sh = field_shown(k, &len);
+    int cx = focused ? fw(sh, shown_off(k, fcaret)) : 0;
+    if (focused) {  // keep the caret in view
+        int total = fw(sh, len);
+        if (cx - fsx > iw) fsx = cx - iw;
+        if (cx < fsx) fsx = cx;
+        if (fsx > 0 && total - fsx < iw) fsx = MAX(0, total - iw);
+    }
+    int sx = focused ? fsx : 0;
+    int a = fit_boundary(sh, len, sx);
+    if (fw(sh, a) < sx) a = next_char(sh, len, a);
+    int e = fit_boundary(sh, len, sx + iw);
+    if (s1 > s0) {
+        int x0 = fw(sh, MAX(shown_off(k, s0), a)) - sx, x1 = fw(sh, MIN(shown_off(k, s1), e)) - sx;
+        if (x1 > x0) fill(tx + x0, ty, x1 - x0, th, C_SELECTION);
+    }
+    if (e > a) lw_text(fb, W, H, tx + fw(sh, a) - sx, ty, sh + a, e - a, size, 0, C_TEXT);
+    if (blink) fill(tx + cx - sx, ty, MAX(1, (int)S), th, C_TEXT);
+}
+
 static void draw_control(Item *it, int y) {
     Control *k = &controls[it->ref];
     Style cs;
@@ -2626,43 +3401,7 @@ static void draw_control(Item *it, int y) {
         lw_text(fb, W, H, it->x + it->w - (int)(18 * S), ty, "\xE2\x96\xBE", 3, cs.size, 0, C_TEXT);
         return;
     }
-    default: {
-        fill(it->x, y, it->w, it->h, RGB(255, 255, 255));
-        frame_rect(it->x, y, it->w, it->h, it->ref == focus ? 2 * b : b, border);
-        int tx = it->x + (int)(6 * S);
-        if (k->kind == K_TEXTAREA) ty = y + (int)(4 * S);
-        if (k->vlen) {
-            if (k->kind == K_PASSWORD) {
-                char dots[96];
-                int n = 0;
-                for (int i = 0; i < k->vlen && n + 3 <= (int)sizeof dots; i++)
-                    if ((k->value[i] & 0xC0) != 0x80) { dots[n++] = (char)0xE2; dots[n++] = (char)0x80; dots[n++] = (char)0xA2; }
-                lw_text(fb, W, H, tx, ty, dots, n, cs.size, 0, C_TEXT);
-            } else {
-                // show the end of long values, like a scrolled text box
-                int start = 0;
-                while (start < k->vlen && text_w(k->value + start, k->vlen - start, &cs) > it->w - (int)(14 * S)) {
-                    start++;
-                    while (start < k->vlen && (k->value[start] & 0xC0) == 0x80) start++;
-                }
-                if (it->ref == focus && focus_all)
-                    fill(tx, ty, text_w(k->value + start, k->vlen - start, &cs), ascent(cs.size) + descent(cs.size), C_SELECTION);
-                lw_text(fb, W, H, tx, ty, k->value + start, k->vlen - start, cs.size, 0, C_TEXT);
-            }
-        } else {
-            const char *ph = attr(k->node, "placeholder");
-            if (ph) lw_text(fb, W, H, tx, ty, ph, lw_strlen(ph), cs.size, 0, RGB(150, 150, 150));
-        }
-        if (it->ref == focus && ((int)(lw_now() / 530) & 1) == 0) {
-            int cw = 0;
-            if (k->vlen && k->kind != K_PASSWORD) {
-                int start = 0;
-                while (start < k->vlen && text_w(k->value + start, k->vlen - start, &cs) > it->w - (int)(14 * S)) start++;
-                cw = text_w(k->value + start, k->vlen - start, &cs);
-            }
-            fill(tx + cw + 1, ty, MAX(1, (int)S), ascent(cs.size) + descent(cs.size), C_TEXT);
-        }
-    }
+    default: draw_field(it, y, k); return;
     }
 }
 
@@ -2857,6 +3596,128 @@ static void select_around(const char *p, int what) {
     dirty = 1;
 }
 
+// ---- find in page (lw_find) ------------------------------------------------------------
+// The browser's find bar (Ctrl+F) asks. Matches are looked for in the laid-out text as
+// copying would give it (so "quick brown" is found across a wrapped line), ignoring case,
+// and kept as item positions, in document order; when the layout changes they are looked
+// for again.
+
+typedef struct { int i0, o0, i1, o1; } Match;  // from item i0 at byte o0 to item i1 at byte o1
+static Match *matches;
+static int nmatches, matches_cap, match_cur = -1;
+static char find_text[256];
+static int find_len;
+static u8 find_pass;
+static int find_limit;  // draw_limit at the last search
+static double find_t;   // and when it was
+
+static void scroll_to(int y);
+static u8 fold(u8 c) { return c >= 'A' && c <= 'Z' ? (u8)(c + 32) : c; }
+
+static void find_run(void) {
+    nmatches = 0;
+    find_pass = layout_pass;
+    find_limit = draw_limit;
+    find_t = lw_now();
+    if (!find_len) return;
+    int total = 0, nt = 0;
+    Item *prev = 0;
+    for (int i = 0; i < draw_limit; i++) {
+        Item *it = &items[i];
+        if (it->kind != IT_TEXT) continue;
+        if (prev) total += item_gap(prev, it, 0);
+        total += it->len;
+        nt++;
+        prev = it;
+    }
+    if (total < find_len) return;
+    char *t = (char *)must_alloc((u32)total);
+    int *ti = (int *)must_alloc((u32)nt * 4), *tp = (int *)must_alloc((u32)nt * 4);  // each text item and where it starts in t
+    int k = 0, n = 0;
+    prev = 0;
+    for (int i = 0; i < draw_limit; i++) {
+        Item *it = &items[i];
+        if (it->kind != IT_TEXT) continue;
+        if (prev) k += item_gap(prev, it, t + k);
+        ti[n] = i;
+        tp[n++] = k;
+        __builtin_memcpy(t + k, it->s, (u32)it->len);
+        k += it->len;
+        prev = it;
+    }
+    int j = 0;  // the text item the search is in
+    for (int pos = 0; pos + find_len <= k && nmatches < 0xFFFF; pos++) {
+        int q = 0;
+        while (q < find_len && fold((u8)t[pos + q]) == fold((u8)find_text[q])) q++;
+        if (q < find_len) continue;
+        Match m;
+        while (j + 1 < n && tp[j + 1] <= pos) j++;
+        if (pos >= tp[j] + items[ti[j]].len && j + 1 < n) { m.i0 = ti[j + 1]; m.o0 = 0; }  // starts in a gap
+        else { m.i0 = ti[j]; m.o0 = pos - tp[j]; }
+        int e = pos + find_len, je = j;
+        while (je + 1 < n && tp[je + 1] < e) je++;
+        m.i1 = ti[je];
+        m.o1 = MIN(e - tp[je], items[ti[je]].len);
+        matches = (Match *)grow_array(matches, nmatches, &matches_cap, sizeof(Match));
+        matches[nmatches++] = m;
+        pos = e - 1;
+    }
+    mem_free(t);
+    mem_free(ti);
+    mem_free(tp);
+}
+
+static void find_reveal(void) {
+    if (match_cur < 0 || match_cur >= nmatches) return;
+    Item *it = &items[matches[match_cur].i0];
+    if (it->y < scroll_y + (int)(50 * S) || it->y + it->h > scroll_y + H - (int)(60 * S)) scroll_to(it->y - H / 3);
+    dirty = 1;
+}
+
+// how: 0 = look for text[0..len) (memory from lw_alloc, freed here), starting from what is
+// in view; 1 / -1 = the next / previous match; 2 = stop (no highlights); 3 = just tell.
+// Returns (the current match, from 1) << 16 | the number of matches, or 0 for none.
+LW_EXPORT(lw_find) int lw_find(const char *text, int len, int how) {
+    if (how == 0) {
+        find_len = MIN(MAX(len, 0), (int)sizeof find_text);
+        while (find_len > 0 && find_len < len && (text[find_len] & 0xC0) == 0x80) find_len--;
+        if (find_len) __builtin_memcpy(find_text, text, (u32)find_len);
+        if (text) mem_free((void *)text);
+        find_run();
+        match_cur = -1;
+        for (int m = 0; m < nmatches && match_cur < 0; m++)
+            if (items[matches[m].i0].y >= scroll_y) match_cur = m;
+        if (match_cur < 0 && nmatches) match_cur = 0;
+        find_reveal();
+        dirty = 1;
+    } else if ((how == 1 || how == -1) && nmatches) {
+        match_cur = (match_cur + how + nmatches) % nmatches;
+        find_reveal();
+    } else if (how == 2) {
+        find_len = nmatches = 0;
+        match_cur = -1;
+        dirty = 1;
+    }
+    return nmatches ? (match_cur + 1) << 16 | nmatches : 0;
+}
+
+static void draw_matches(int i, Item *it, int y) {  // behind item i's text
+    int lo = 0, hi = nmatches;  // the first match that doesn't end before item i
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (matches[mid].i1 < i) lo = mid + 1;
+        else hi = mid;
+    }
+    for (int m = lo; m < nmatches && matches[m].i0 <= i; m++) {
+        Match *mt = &matches[m];
+        int x0 = it->x + (i == mt->i0 ? item_w(it, mt->o0) : 0);
+        int x1 = it->x + (i == mt->i1 ? item_w(it, mt->o1) : it->w);
+        if (i < mt->i1 && i + 1 < draw_limit && items[i + 1].kind == IT_TEXT && same_line(it, &items[i + 1]) && items[i + 1].x > x1)
+            x1 = items[i + 1].x;
+        if (x1 > x0) fill(x0, y, x1 - x0, it->h, m == match_cur ? RGB(255, 150, 50) : RGB(255, 236, 120));
+    }
+}
+
 static void redraw(void) {
     u32 page_bg = has_body_bg ? body_bg : RGB(255, 255, 255);
     fill_span(fb, W * H, page_bg);
@@ -2864,9 +3725,10 @@ static void redraw(void) {
     int s0 = -1, s1 = -1;
     const char *q0 = 0, *q1 = 0;
     if (!sel_range(&s0, &q0, &s1, &q1)) s0 = s1 = -1;
+    for (int pass = 0; pass < (nfloats ? 2 : 1); pass++)
     for (int i = 0; i < draw_limit; i++) {
         Item *it = &items[i];
-        if (it->y > bottom || it->y + it->h < top) continue;
+        if (it->y > bottom || it->y + it->h < top || it->layer != pass) continue;
         int y = it->y - scroll_y;
         if (it->kind == IT_TEXT && i >= s0 && i <= s1) {  // selected: a background behind the text
             int x0 = it->x + (i == s0 ? item_w(it, (int)(q0 - it->s)) : 0);
@@ -2875,6 +3737,7 @@ static void redraw(void) {
                 x1 = items[i + 1].x;  // and the space to the next word
             if (x1 > x0) fill(x0, y, x1 - x0, it->h, C_SELECTION);
         }
+        if (it->kind == IT_TEXT && nmatches) draw_matches(i, it, y);
         switch (it->kind) {
         case IT_TEXT: draw_text_item(it, y, it->link >= 0 && it->link == hover_link); break;
         case IT_RECT:
@@ -2939,16 +3802,31 @@ static int clamp_scroll(int y) {
 
 static void scroll_to(int y) { target_y = clamp_scroll(y); dirty = 1; }
 
+// Whether an element's id (or name) is the #fragment `f`: as it is, or percent-decoded,
+// as browsers try it (a Thai heading's id comes as "#%E0%B8%9B..." in links and addresses).
+static int anchor_is(const char *a, const char *f, int len) {
+    int i = 0, j = 0;
+    while (i < len && a[j] && a[j] == f[i]) i++, j++;
+    if (i == len && !a[j]) return 1;
+    for (i = 0, j = 0; i < len; j++) {
+        int c = (u8)f[i];
+        if (c == '%' && i + 2 < len && hexv(f[i + 1]) >= 0 && hexv(f[i + 2]) >= 0) {
+            c = hexv(f[i + 1]) * 16 + hexv(f[i + 2]);
+            i += 3;
+        } else {
+            i++;
+        }
+        if ((u8)a[j] != c || !a[j]) return 0;
+    }
+    return !a[j];
+}
+
 static Node *find_anchor(Node *n, const char *id, int len) {
     for (Node *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM) continue;
         const char *a = attr(c, "id");
         if (!a) a = attr(c, "name");
-        if (a && lw_strlen(a) == len) {
-            int ok = 1;
-            for (int i = 0; i < len && ok; i++) ok = a[i] == id[i];
-            if (ok) return c;
-        }
+        if (a && anchor_is(a, id, len)) return c;
         Node *f = find_anchor(c, id, len);
         if (f) return f;
     }
@@ -3070,7 +3948,9 @@ static void activate_control(int idx) {
     switch (k->kind) {
     case K_TEXT: case K_PASSWORD: case K_TEXTAREA:
         focus = idx;
-        focus_all = 0;
+        fcaret = fanchor = k->vlen;
+        fsx = fsy = 0;
+        fwant_x = -1;
         sel_a = sel_b = 0;  // typing goes to the field now, and so does Ctrl+C
         caret_t = lw_now();
         break;
@@ -3110,9 +3990,14 @@ static int item_at(int x, int y, int kind) {
 }
 
 static int pressed_link = -1;
+static int mouse_x, mouse_y, mouse_in, hover_scroll;  // where the mouse is, to update the hover when the page scrolls
 
 LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
     int x = (int)fx, y = (int)fy;
+    mouse_x = x;
+    mouse_y = y;
+    mouse_in = kind != LW_LEAVE;
+    hover_scroll = scroll_y;
     int bar_x = W - (int)(12 * S);
     if (kind == LW_WHEEL) {
         pending_anchor = 0;  // the reader took over
@@ -3155,6 +4040,15 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
         }
         return LW_CURSOR_HAND;
     }
+    if (field_drag) {  // selecting in the focused field
+        Item *fi = focus >= 0 ? control_item(focus) : 0;
+        if (fi) {
+            int p = field_pos_at(&controls[focus], fi, x, y);
+            if (p != fcaret) { fcaret = p; dirty = 1; }
+        }
+        if (kind == LW_UP && button == 0) field_drag = 0;
+        return LW_CURSOR_TEXT;
+    }
     drag_x = x;
     drag_y = y;
     if (press_down && kind == LW_MOVE && !sel_drag && (x - press_x) * (x - press_x) + (y - press_y) * (y - press_y) > 16) {
@@ -3175,8 +4069,40 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
     if (link != hover_link || ctl != hover_control) { hover_link = link; hover_control = ctl; dirty = 1; }
     if (kind == LW_DOWN && (button == 0 || button == 1)) {
         pressed_link = link;
-        if (button == 0 && ctl >= 0) activate_control(ctl);
-        else if (button == 0 && focus >= 0) { focus = -1; dirty = 1; }
+        if (button == 0 && ctl >= 0 && is_text_field(&controls[ctl]) && !controls[ctl].disabled) {
+            Control *k = &controls[ctl];
+            int was = focus, p;
+            if (was != ctl) activate_control(ctl);
+            p = field_pos_at(k, &items[ci], x, y);
+            double now = lw_now();
+            int near = (x - field_click_x) * (x - field_click_x) + (y - field_click_y) * (y - field_click_y) <= 25;
+            field_clicks = now - field_click_t < 500 && near && was == ctl ? field_clicks % 3 + 1 : 1;
+            field_click_t = now;
+            field_click_x = x;
+            field_click_y = y;
+            if (field_clicks == 3 || (field_clicks == 2 && k->kind == K_PASSWORD)) {
+                fanchor = 0;
+                fcaret = k->vlen;
+            } else if (field_clicks == 2) {  // a word
+                int a = p, e = p;
+                while (a > 0 && word_byte(k->value[a - 1])) a--;
+                while (e < k->vlen && word_byte(k->value[e])) e++;
+                fanchor = a;
+                fcaret = e;
+            } else {
+                fcaret = p;
+                if (!(lw_mods() & LW_SHIFT) || was != ctl) fanchor = p;
+                field_drag = 1;
+            }
+            fwant_x = -1;
+            caret_t = now;
+            dirty = 1;
+        } else if (button == 0 && ctl >= 0) {
+            activate_control(ctl);
+        } else if (button == 0 && focus >= 0) {
+            focus = -1;
+            dirty = 1;
+        }
     }
     if (kind == LW_DOWN && button == 0 && ctl < 0) {
         double now = lw_now();
@@ -3219,7 +4145,43 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
     return ti >= 0 ? LW_CURSOR_TEXT : LW_CURSOR_ARROW;
 }
 
-// Pastes the clipboard into the focused text field (at the end, or over a Ctrl+A selection).
+static int field_sel(int *a, int *b) {
+    *a = MIN(fcaret, fanchor);
+    *b = MAX(fcaret, fanchor);
+    return *b > *a;
+}
+
+static void field_set_caret(int off, int extend) {
+    fcaret = off;
+    if (!extend) fanchor = off;
+    caret_t = lw_now();
+    dirty = 1;
+}
+
+// The selection (or just the caret's place) becomes t[0..n).
+static void field_replace(Control *k, const char *t, int n) {
+    int a, b;
+    field_sel(&a, &b);
+    int room = 4000 - (k->vlen - (b - a));
+    if (n > room) {
+        n = room < 0 ? 0 : room;
+        while (n > 0 && (t[n] & 0xC0) == 0x80) n--;  // not in the middle of a character
+    }
+    int len = k->vlen - (b - a) + n;
+    char *v = (char *)must_alloc((u32)len + 1);
+    __builtin_memcpy(v, k->value, (u32)a);
+    __builtin_memcpy(v + a, t, (u32)n);
+    __builtin_memcpy(v + a + n, k->value + b, (u32)(k->vlen - b));
+    set_value(k, v, len);
+    mem_free(v);
+    fcaret = fanchor = a + n;
+    fwant_x = -1;
+    caret_t = lw_now();
+    dirty = 1;
+}
+
+// Pastes the clipboard into the focused field, over its selection. One-line fields get
+// newlines and tabs as spaces.
 static void paste_into_field(Control *k) {
     char buf[4096];
     int n = lw_clipboard_get(buf, (int)sizeof buf);
@@ -3227,37 +4189,37 @@ static void paste_into_field(Control *k) {
     if (n > (int)sizeof buf) n = (int)sizeof buf;
     while (n > 0 && (buf[n - 1] & 0xC0) == 0x80) n--;  // a character cut off at the end
     if (n > 0 && (u8)buf[n - 1] >= 0xC0) n--;
-    char v[4096];
-    int base = focus_all ? 0 : k->vlen, m = base;
-    __builtin_memcpy(v, k->value, (u32)base);
-    for (int i = 0; i < n && m < 4000; i++) {
+    int m = 0;
+    for (int i = 0; i < n; i++) {
         u8 c = (u8)buf[i];
         if (c == '\r') continue;
-        v[m++] = c < 32 ? ' ' : (char)c;  // fields here are one line: newlines and tabs become spaces
+        buf[m++] = c == '\n' && k->kind == K_TEXTAREA ? '\n' : c < 32 ? ' ' : (char)c;
     }
-    while (m > 0 && (v[m - 1] & 0xC0) == 0x80 && m >= 4000) m--;
-    set_value(k, v, m);
-    focus_all = 0;
-    caret_t = lw_now();
+    field_replace(k, buf, m);
+}
+
+// Tab: the next (or previous) text field, with its value selected, scrolled into view.
+static void focus_next(int dir) {
+    int i = focus;
+    for (int step = 0; step < ncontrols; step++) {
+        i = (i + dir + ncontrols) % ncontrols;
+        Control *c = &controls[i];
+        Item *it = control_item(i);
+        if (!is_text_field(c) || c->disabled || !it) continue;
+        activate_control(i);
+        fanchor = 0;
+        fcaret = c->vlen;
+        if (it->y < scroll_y || it->y + it->h > scroll_y + H) scroll_to(it->y - H / 3);
+        return;
+    }
+    focus = -1;
     dirty = 1;
 }
 
 LW_EXPORT(lw_char) void lw_char(int cp) {
     if (focus < 0) return;
-    Control *k = &controls[focus];
-    if (focus_all) {  // typing replaces what Ctrl+A selected
-        k->vlen = 0;
-        focus_all = 0;
-    }
     u8 buf[4];
-    int n = utf8_put(buf, (u32)cp);
-    if (k->vlen + n > 4000) return;
-    char tmp[4096];
-    __builtin_memcpy(tmp, k->value, (u32)k->vlen);
-    __builtin_memcpy(tmp + k->vlen, buf, (u32)n);
-    set_value(k, tmp, k->vlen + n);
-    caret_t = lw_now();
-    dirty = 1;
+    field_replace(&controls[focus], (const char *)buf, utf8_put(buf, (u32)cp));
 }
 
 LW_EXPORT(lw_key) int lw_key(int key, int mods, int down) {
@@ -3268,43 +4230,73 @@ LW_EXPORT(lw_key) int lw_key(int key, int mods, int down) {
     int cut = ctrl && key == 'X';
     if (focus >= 0) {
         Control *k = &controls[focus];
-        int secret = k->kind == K_PASSWORD;
-        if (ctrl && key == 'A') { focus_all = k->vlen > 0; dirty = 1; return 1; }
+        int secret = k->kind == K_PASSWORD, area = k->kind == K_TEXTAREA, a, b;
+        if (fcaret > k->vlen) fcaret = k->vlen;
+        if (fanchor > k->vlen) fanchor = k->vlen;
+        int has = field_sel(&a, &b);
+        if (ctrl && key == 'A') { fanchor = 0; fcaret = k->vlen; dirty = 1; return 1; }
         if (paste) { paste_into_field(k); return 1; }
-        if (copy || cut) {  // the field's text, if Ctrl+A selected it (never a password's)
-            if (focus_all && !secret) {
-                lw_clipboard_set(k->value, k->vlen);
-                if (cut) { k->vlen = 0; focus_all = 0; dirty = 1; }
+        if (copy || cut) {  // the selected part (never a password's)
+            if (has && !secret) {
+                lw_clipboard_set(k->value + a, b - a);
+                if (cut) field_replace(k, "", 0);
             }
             return 1;
         }
-        if (key == LW_KEY_BACKSPACE && focus_all) {
-            k->vlen = 0;
-            focus_all = 0;
-            dirty = 1;
+        switch (key) {
+        case LW_KEY_LEFT:
+            field_set_caret(has && !shift ? a : ctrl ? prev_word(k->value, fcaret) : prev_char(k->value, fcaret), shift);
+            fwant_x = -1;
             return 1;
-        }
-        if (focus_all && (key == LW_KEY_LEFT || key == LW_KEY_RIGHT || key == LW_KEY_HOME || key == LW_KEY_END)) {
-            focus_all = 0;
-            dirty = 1;
-        }
-        if (key == LW_KEY_BACKSPACE) {
-            if (k->vlen) {
-                int n = k->vlen - 1;
-                while (n > 0 && (k->value[n] & 0xC0) == 0x80) n--;
-                k->vlen = n;
+        case LW_KEY_RIGHT:
+            field_set_caret(has && !shift ? b : ctrl ? next_word(k->value, k->vlen, fcaret) : next_char(k->value, k->vlen, fcaret), shift);
+            fwant_x = -1;
+            return 1;
+        case LW_KEY_HOME: case LW_KEY_END: {
+            int to = key == LW_KEY_HOME ? 0 : k->vlen;
+            if (area && !ctrl) {  // the start or end of the line
+                field_lines(k, field_inner_w(control_item(focus)));
+                int l = caret_line(fcaret);
+                to = key == LW_KEY_HOME ? fl_start[l] : fl_start[l] + fl_len[l];
+                if (key == LW_KEY_END && to > fl_start[l] && l + 1 < fl_n && k->value[to - 1] == ' ') to--;  // before a wrap
             }
-            dirty = 1;
+            field_set_caret(to, shift);
+            fwant_x = -1;
             return 1;
         }
-        if (key == LW_KEY_ENTER && k->kind != K_TEXTAREA) {
-            Control *by = 0;  // implicit submission uses the form's first submit button
-            for (int i = 0; i < ncontrols; i++)
-                if (controls[i].form == k->form && (controls[i].kind == K_SUBMIT || controls[i].kind == K_IMAGE)) { by = &controls[i]; break; }
-            submit(k->form, by);
+        case LW_KEY_UP: case LW_KEY_DOWN: {
+            if (!area) break;  // a one-line field: the page scrolls
+            field_lines(k, field_inner_w(control_item(focus)));
+            int l = caret_line(fcaret), nl = l + (key == LW_KEY_DOWN ? 1 : -1);
+            if (fwant_x < 0) fwant_x = fw(k->value + fl_start[l], fcaret - fl_start[l]);
+            int want = fwant_x;
+            if (nl < 0) field_set_caret(0, shift);
+            else if (nl >= fl_n) field_set_caret(k->vlen, shift);
+            else field_set_caret(fl_start[nl] + nearest_boundary(k->value + fl_start[nl], fl_len[nl], want), shift);
+            fwant_x = want;
             return 1;
         }
-        if (key == LW_KEY_ESCAPE || key == LW_KEY_TAB) { focus = -1; dirty = 1; return 1; }
+        case LW_KEY_BACKSPACE:
+            if (!has) fanchor = ctrl ? prev_word(k->value, fcaret) : prev_cp(k->value, fcaret);
+            field_replace(k, "", 0);
+            return 1;
+        case LW_KEY_DELETE:
+            if (!has) fanchor = ctrl ? next_word(k->value, k->vlen, fcaret) : next_char(k->value, k->vlen, fcaret);
+            field_replace(k, "", 0);
+            return 1;
+        case LW_KEY_ENTER:
+            if (area) {
+                field_replace(k, "\n", 1);
+            } else {
+                Control *by = 0;  // implicit submission uses the form's first submit button
+                for (int i = 0; i < ncontrols; i++)
+                    if (controls[i].form == k->form && (controls[i].kind == K_SUBMIT || controls[i].kind == K_IMAGE)) { by = &controls[i]; break; }
+                submit(k->form, by);
+            }
+            return 1;
+        case LW_KEY_TAB: focus_next(shift ? -1 : 1); return 1;
+        case LW_KEY_ESCAPE: focus = -1; dirty = 1; return 1;
+        }
         if (key != LW_KEY_UP && key != LW_KEY_DOWN && key != LW_KEY_PAGEUP && key != LW_KEY_PAGEDOWN) return 1;
     }
     if (ctrl && key == 'A') { select_all_text(); return 1; }
@@ -3419,13 +4411,9 @@ static void node_opened(Node *n) {
     if (frag_len && !frag_found) {  // the #fragment's target (find_anchor's rule: id, else name)
         const char *a = attr(n, "id");
         if (!a) a = attr(n, "name");
-        if (a && lw_strlen(a) == frag_len) {
-            int same = 1;
-            for (int i = 0; i < frag_len && same; i++) same = a[i] == frag[i];
-            if (same) {
-                frag_found = 1;
-                pending_anchor = n;
-            }
+        if (a && anchor_is(a, frag, frag_len)) {
+            frag_found = 1;
+            pending_anchor = n;
         }
     }
 }
@@ -3486,13 +4474,22 @@ static void maybe_show(void) {
         if (count_text(first_main) >= 40) m = first_main;
         else if (!first_main->open) m = 0;
         else return;  // wait for more of it
-    } else if (parse_dropped + parse_pos < (256 << 10)) {
-        return;  // no <main> yet; most pages that have one have it well before this
+    } else if (parse_dropped + parse_pos < (256 << 10) && lw_now() - doc_t0 < 1000) {
+        return;  // no <main> yet; pages that have one mostly have it well before this much (or this long)
     } else {
-        m = 0;  // show the full page for now; settled when the parse is done
+        m = 0;  // show the full page for now (see maybe_late_main); settled when the parse is done
     }
     main_node = m;
     show_document();
+}
+
+// The full page is shown and a <main> turns up after all (a slow connection): switch to
+// reader view now, if the reader hasn't scrolled away from the top yet.
+static void maybe_late_main(void) {
+    if (!has_doc || main_node || parse_done || !first_main || full_page || scroll_y || target_y) return;
+    if (count_text(first_main) < 40) return;
+    main_node = first_main;
+    need_layout = 1;
 }
 
 static void finish_parse(void) {
@@ -3656,6 +4653,7 @@ LW_EXPORT(lw_frame) void lw_frame(double now) {
     if (toast_len && now > toast_until) { toast_len = 0; dirty = 1; }
     if (doc_started && !parse_done) pump_parse(lw_now() + (has_doc ? SLICE_MS : 2 * SLICE_MS));
     if (!has_doc) maybe_show();
+    else maybe_late_main();
     if (css_new_rules) {  // a stylesheet came in after the page was shown
         css_new_rules = 0;
         if (layout_running) css_stale = 1;  // the part laid out so far used the old rules
@@ -3691,6 +4689,12 @@ LW_EXPORT(lw_frame) void lw_frame(double now) {
     }
     check_anchor();
     check_restore();
+    if (find_len && (find_pass != layout_pass || find_limit != draw_limit) && (!layout_running || now - find_t > 300)) {
+        int keep = match_cur;  // the layout changed: look again (the browser asks for the count)
+        find_run();
+        match_cur = nmatches ? MIN(MAX(keep, 0), nmatches - 1) : -1;
+        dirty = 1;
+    }
     if (sel_drag && (drag_y < 0 || drag_y >= H)) {  // dragging a selection past the edge scrolls
         int step = (drag_y < 0 ? drag_y : drag_y - H + 1) / 2;
         step = step < 0 ? MIN(step, -(int)(4 * S)) : MAX(step, (int)(4 * S));
@@ -3706,6 +4710,11 @@ LW_EXPORT(lw_frame) void lw_frame(double now) {
         if (step == 0) step = d > 0 ? 1 : -1;
         scroll_y += step;
         dirty = 1;
+    }
+    if (mouse_in && scroll_y != hover_scroll && !press_down && !sel_drag) {  // the page moved under the mouse
+        hover_scroll = scroll_y;
+        int li = item_at(mouse_x, mouse_y, IT_TEXT), l = li >= 0 ? items[li].link : -1;
+        if (l != hover_link) { hover_link = l; dirty = 1; }
     }
     if (focus >= 0 && (int)((now - caret_t) / 530) != (int)((now - 16 - caret_t) / 530)) dirty = 1;
     if (!dirty) return;

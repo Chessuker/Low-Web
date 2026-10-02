@@ -100,7 +100,11 @@ const COLORREF kAccent = RGB(14, 165, 233);
 HINSTANCE g_inst;
 HWND g_main, g_view, g_url, g_btn[4], g_engine_btn;
 HFONT g_ui_font, g_doc_font, g_doc_bold, g_mono_font, g_tab_font, g_icon_font;
-bool g_window_active = true;  // the strip (our title bar) is paler while another window is active
+bool g_window_active = true;
+void find_open();  // find in page (Ctrl+F)
+void find_now(int how);
+void find_close();
+bool find_open_now();  // the strip (our title bar) is paler while another window is active
 int g_dpi = 96;
 WNDPROC g_url_proc;
 
@@ -388,6 +392,8 @@ struct Doc {
     int laid_w = -1, height = 0;
     int sel_a = 0, sel_b = 0;  // selected: text[min..max) (sel_a where it started)
     bool selecting = false;
+    std::vector<std::pair<int, int>> found;  // find in page: [start, end) in text
+    int found_cur = -1;
 };
 
 struct Tab;
@@ -404,6 +410,7 @@ struct Page {
     bool viewer = false;  // the HTML viewer showing a document (it can be loaded again from its URL)
     bool typed = false;   // the user typed into it (a form): don't put the tab to sleep
     int f_state = -1, f_restore = -1;  // optional: the page's reading position (lw_state / lw_restore)
+    int f_find = -1;                   // optional: find in page (lw_find)
     int f_start = -1, f_resize = -1, f_frame = -1, f_pointer = -1, f_key = -1, f_char = -1, f_alloc = -1,
         f_on_file = -1, f_on_fetch = -1, f_on_fetch_ex = -1,
         f_on_fetch_begin = -1, f_on_fetch_data = -1, f_on_fetch_end = -1;
@@ -1136,6 +1143,7 @@ void start_wasm_page(Tab &t, const std::vector<uint8_t> &module, const std::stri
     p.f_on_fetch_end = find_export(p, "lw_on_fetch_end", "ii");
     p.f_state = find_export(p, "lw_state", "");
     p.f_restore = find_export(p, "lw_restore", "i");
+    p.f_find = find_export(p, "lw_find", "iii");
     p.viewer = doc != nullptr;
     if (p.f_on_fetch_begin < 0 || p.f_on_fetch_data < 0 || p.f_on_fetch_end < 0)
         p.f_on_fetch_begin = p.f_on_fetch_data = p.f_on_fetch_end = -1;  // all or nothing
@@ -1197,6 +1205,7 @@ void commit(Tab &t, LoadResult &lr, bool streamed = false) {
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
     }
 
+    if (find_open_now() && is_active(&t)) find_close();
     t.page.reset();
     t.frame = Frame();
     t.title.clear();
@@ -1267,6 +1276,7 @@ void commit(Tab &t, LoadResult &lr, bool streamed = false) {
 
 // Makes the tab that has just become the active one ready to be seen.
 void show_tab(Tab &t) {
+    if (find_open_now()) find_close();
     SetWindowTextW(g_url, t.typed_dirty ? t.typed.c_str() : display_url(t.current_url).c_str());
     update_buttons();
     update_title();
@@ -1502,6 +1512,14 @@ void paint_doc(HDC hdc, const RECT &rc, Doc &doc) {
             if (s1 > l.start + l.len) r.right += S(6);
             if (r.right > r.left) FillRect(mem, &r, sel);
         }
+        for (size_t m = 0; m < doc.found.size(); m++) {  // find in page
+            int fa = std::max(doc.found[m].first, l.start), fb = std::min(doc.found[m].second, l.start + l.len);
+            if (fa >= fb) continue;
+            RECT r{line_x(mem, doc, l, fa - l.start), y, line_x(mem, doc, l, fb - l.start), y + l.h};
+            HBRUSH fbr = CreateSolidBrush((int)m == doc.found_cur ? RGB(255, 150, 50) : RGB(255, 236, 120));
+            FillRect(mem, &r, fbr);
+            DeleteObject(fbr);
+        }
         SetTextColor(mem, l.heading ? RGB(17, 24, 39) : RGB(55, 65, 81));
         TextOutW(mem, l.x, y, doc.text.c_str() + l.start, l.len);
     }
@@ -1612,6 +1630,13 @@ void new_tab_command() {
 // Browser-level shortcuts. Returns true if handled.
 bool browser_key(WPARAM vk, int mods) {
     bool ctrl = mods & 2, alt = mods & 4, shift = mods & 1;
+    if (ctrl && vk == 'F') { find_open(); return true; }
+    if (vk == VK_F3 || (ctrl && vk == 'G')) {
+        if (find_open_now()) find_now(shift ? -1 : 1);
+        else find_open();
+        return true;
+    }
+    if (vk == VK_ESCAPE && find_open_now()) { find_close(); return true; }
     if ((ctrl && vk == 'L') || vk == VK_F6 || (alt && vk == 'D')) { focus_url_bar(); return true; }
     if (vk == VK_F5 || (ctrl && vk == 'R')) { reload(ctrl && (vk == VK_F5 || shift)); return true; }  // Ctrl+F5, Ctrl+Shift+R: hard
     if ((alt && vk == VK_LEFT) || vk == VK_BROWSER_BACK) { go_history(-1); return true; }
@@ -1992,6 +2017,200 @@ int tabstrip_hit(int x, int y, bool *on_close, bool *on_plus) {
 }
 
 // =====================================================================================
+// find in page (Ctrl+F): a bar at the top right of the view
+// =====================================================================================
+// The page does the finding if it can (lw_find: the viewer highlights the matches itself);
+// documents the browser shows itself are searched here. The bar shows "current/count".
+
+HWND g_find, g_find_edit;
+WNDPROC g_find_edit_proc;
+int g_find_status = -1;  // what lw_find last said ((current << 16) | count), -1: this page can't find
+int g_find_tab = 0;      // the tab whose page has highlights
+
+bool find_open_now() { return g_find && IsWindowVisible(g_find); }
+
+std::wstring find_text() {
+    int n = GetWindowTextLengthW(g_find_edit);
+    std::wstring t(n, 0);
+    GetWindowTextW(g_find_edit, t.data(), n + 1);
+    return t;
+}
+
+void find_show_status(int st) {
+    if (st == g_find_status) return;
+    g_find_status = st;
+    if (g_script_mode)
+        log_line(st < 0 ? "[find] not supported" : "[find] " + std::to_string(st >> 16) + "/" + std::to_string(st & 0xFFFF));
+    if (g_find) InvalidateRect(g_find, nullptr, FALSE);
+}
+
+// The browser's own documents: matches in Doc::text, ignoring case.
+int doc_find(Tab &t, const std::wstring &needle, int how) {
+    Doc &doc = t.doc;
+    RECT rc;
+    GetClientRect(g_view, &rc);
+    doc_layout(doc, rc.right);
+    if (how == 0) {
+        doc.found.clear();
+        doc.found_cur = -1;
+        std::wstring hay = doc.text, nd = needle;
+        for (auto &c : hay) c = towlower(c);
+        for (auto &c : nd) c = towlower(c);
+        for (size_t at = nd.empty() ? std::wstring::npos : hay.find(nd); at != std::wstring::npos && doc.found.size() < 0xFFFF;
+             at = hay.find(nd, at + nd.size()))
+            doc.found.push_back({(int)at, (int)(at + nd.size())});
+        for (size_t m = 0; m < doc.found.size() && doc.found_cur < 0; m++)  // the first one from what is in view
+            for (const DocLine &l : doc.lines)
+                if (doc.found[m].first >= l.start && doc.found[m].first <= l.start + l.len && l.y >= doc.scroll) { doc.found_cur = (int)m; break; }
+        if (doc.found_cur < 0 && !doc.found.empty()) doc.found_cur = 0;
+    } else if ((how == 1 || how == -1) && !doc.found.empty()) {
+        doc.found_cur = (doc.found_cur + how + (int)doc.found.size()) % (int)doc.found.size();
+    } else if (how == 2) {
+        doc.found.clear();
+        doc.found_cur = -1;
+    }
+    if (doc.found_cur >= 0 && how != 2 && how != 3) {  // scroll it into view
+        for (const DocLine &l : doc.lines)
+            if (doc.found[doc.found_cur].first >= l.start && doc.found[doc.found_cur].first <= l.start + l.len) {
+                if (l.y < doc.scroll || l.y + l.h > doc.scroll + rc.bottom) doc.scroll = std::clamp(l.y - (int)rc.bottom / 3, 0, doc_max_scroll(doc));
+                break;
+            }
+    }
+    InvalidateRect(g_view, nullptr, FALSE);
+    return doc.found.empty() ? 0 : (doc.found_cur + 1) << 16 | (int)doc.found.size();
+}
+
+// Asks the tab's page (or searches its document). how: as lw_find. -1 if it can't find.
+int find_in(Tab &t, const std::wstring &needle, int how) {
+    if (showing_doc(t)) return doc_find(t, needle, how);
+    if (!t.page || t.page->crashed || t.page->f_find < 0) return -1;
+    uint32_t at = 0, extra_at = 0;
+    std::string text = narrow(needle);
+    if (how == 0 && !text.empty()) {
+        at = page_give(t, (const uint8_t *)text.data(), text.size(), "", extra_at);
+        if (!at) return -1;
+    }
+    uint64_t r = 0;
+    if (!page_call(t, t.page->f_find, {at, at ? (uint32_t)text.size() : 0u, (uint32_t)how}, &r)) return -1;
+    if (how != 3) InvalidateRect(g_view, nullptr, FALSE);
+    return (int)(uint32_t)r;
+}
+
+void find_now(int how) {  // 0: the text changed; 1 / -1: next / previous
+    if (g_tabs.empty()) return;
+    Tab &t = T();
+    g_find_tab = t.id;
+    find_show_status(find_in(t, find_text(), how));
+}
+
+void find_close() {
+    if (!g_find) return;
+    ShowWindow(g_find, SW_HIDE);
+    if (Tab *t = tab_by_id(g_find_tab)) find_in(*t, L"", 2);
+    g_find_tab = 0;
+    g_find_status = -1;
+    SetFocus(g_view);
+}
+
+void layout_find_bar() {
+    if (!g_find) return;
+    RECT rc;
+    GetClientRect(g_main, &rc);
+    int w = S(372), h = S(42);
+    SetWindowPos(g_find, HWND_TOP, rc.right - w - S(16), tabstrip_height() + toolbar_height() + S(6), w, h, SWP_NOACTIVATE);
+    MoveWindow(g_find_edit, S(10), (h - S(24)) / 2, S(196), S(24), TRUE);
+}
+
+RECT find_button(int which) {  // 0 previous, 1 next, 2 close
+    int x = S(274) + which * S(30);
+    return RECT{x, S(7), x + S(28), S(35)};
+}
+
+LRESULT CALLBACK find_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBRUSH bg = CreateSolidBrush(RGB(255, 255, 255)), line = CreateSolidBrush(RGB(200, 203, 208));
+        FillRect(hdc, &rc, bg);
+        FrameRect(hdc, &rc, line);
+        DeleteObject(bg);
+        DeleteObject(line);
+        SetBkMode(hdc, TRANSPARENT);
+        SelectObject(hdc, g_tab_font);
+        std::wstring status = g_find_status < 0 ? (find_text().empty() ? L"" : L"can't search")
+                                                : std::to_wstring(g_find_status >> 16) + L"/" + std::to_wstring(g_find_status & 0xFFFF);
+        RECT st{S(210), 0, S(272), rc.bottom};
+        SetTextColor(hdc, g_find_status == 0 && !find_text().empty() ? RGB(200, 40, 40) : RGB(95, 99, 104));
+        DrawTextW(hdc, status.c_str(), -1, &st, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        SelectObject(hdc, g_icon_font);
+        SetTextColor(hdc, RGB(60, 64, 67));
+        const wchar_t *glyphs[3] = {L"\uE70E", L"\uE70D", L"\uE8BB"};  // up, down, close
+        for (int i = 0; i < 3; i++) {
+            RECT b = find_button(i);
+            DrawTextW(hdc, glyphs[i], -1, &b, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        for (int i = 0; i < 3; i++) {
+            RECT b = find_button(i);
+            if (!PtInRect(&b, pt)) continue;
+            if (i == 2) find_close();
+            else find_now(i == 0 ? -1 : 1);
+        }
+        return 0;
+    }
+    case WM_COMMAND:
+        if (HIWORD(wp) == EN_CHANGE) find_now(0);
+        return 0;
+    case WM_CTLCOLOREDIT:
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+LRESULT CALLBACK find_edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wp == VK_RETURN || wp == VK_F3) { find_now(current_mods() & 1 ? -1 : 1); return 0; }
+        if (wp == VK_ESCAPE) { find_close(); return 0; }
+        if (browser_key(wp, current_mods())) return 0;
+        break;
+    case WM_CHAR:
+        if (wp == '\r' || wp == 27) return 0;  // (no beep)
+        break;
+    }
+    return CallWindowProcW(g_find_edit_proc, hwnd, msg, wp, lp);
+}
+
+void find_open() {
+    if (!g_find) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof wc;
+        wc.lpfnWndProc = find_proc;
+        wc.hInstance = g_inst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"LowWebFind";
+        RegisterClassExW(&wc);
+        g_find = CreateWindowExW(0, L"LowWebFind", L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, g_main, nullptr, g_inst, nullptr);
+        g_find_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, g_find, nullptr, g_inst, nullptr);
+        SendMessageW(g_find_edit, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+        SendMessageW(g_find_edit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Find in page");
+        g_find_edit_proc = (WNDPROC)SetWindowLongPtrW(g_find_edit, GWLP_WNDPROC, (LONG_PTR)find_edit_proc);
+    }
+    layout_find_bar();
+    ShowWindow(g_find, SW_SHOWNA);
+    SetFocus(g_find_edit);
+    SendMessageW(g_find_edit, EM_SETSEL, 0, -1);
+    if (!find_text().empty()) find_now(0);
+}
+
+// =====================================================================================
 // the address bar and the main window
 // =====================================================================================
 
@@ -2060,6 +2279,8 @@ void update_engine_button() {
     if (g_engine_btn) SetWindowTextW(g_engine_btn, kEngines[g_engine].label);
 }
 
+void layout_find_bar();
+
 void layout_children() {
     RECT rc;
     GetClientRect(g_main, &rc);
@@ -2075,6 +2296,7 @@ void layout_children() {
     x += ew + S(4);
     MoveWindow(g_url, x, top + (th - uh) / 2, std::max<int>(50, rc.right - x - pad), uh, TRUE);
     MoveWindow(g_view, 0, top + th, rc.right, std::max<int>(1, rc.bottom - top - th), TRUE);
+    layout_find_bar();
     InvalidateRect(g_main, nullptr, FALSE);
 }
 
@@ -2272,6 +2494,10 @@ void save_screenshot(const std::string &path) {
 }
 
 void script_step() {
+    if (!g_script.empty() && g_script.front().find("async") != std::string::npos && g_script.front().find_first_not_of(" async") == std::string::npos) {
+        g_script_async = true;  // (taken even while a page loads: that is what it is for)
+        g_script.pop_front();
+    }
     if ((T().loading && !g_script_async) || steady_ms() < g_script_wait_until) return;
     if (g_script.empty()) {
         if (!g_screenshot_path.empty()) save_screenshot(g_screenshot_path);
@@ -2288,6 +2514,7 @@ void script_step() {
     auto lp = [](int x, int y) { return (LPARAM)MAKELPARAM(x, y); };
     if (o == "wait") { sscanf(cmd.c_str(), " %*s %d", &a); g_script_wait_until = steady_ms() + a; }
     else if (o == "async") g_script_async = true;  // from now on, don't wait for loads to finish (to watch them)
+    else if (o == "sync") g_script_async = false;  // and from now on, do again
     else if (o == "move") { sscanf(cmd.c_str(), " %*s %d %d", &a, &b); SendMessageW(g_view, WM_MOUSEMOVE, 0, lp(a, b)); }
     else if (o == "click" || o == "rclick" || o == "mclick") {
         sscanf(cmd.c_str(), " %*s %d %d", &a, &b);
@@ -2328,6 +2555,13 @@ void script_step() {
         else log_line("[script] cannot read " + path);
     } else if (o == "shot") { sscanf(cmd.c_str(), " %*s %511s", s1); save_screenshot(s1); }
     else if (o == "mem") log_memory();
+    else if (o == "find") {  // find TEXT: open the find bar and type TEXT
+        find_open();
+        SetWindowTextW(g_find_edit, widen(cmd.size() > cmd.find("find") + 5 ? cmd.substr(cmd.find("find") + 5) : "").c_str());
+    } else if (o == "chars") {  // chars TEXT: typed into the page (spaces and any script included)
+        for (wchar_t c : widen(cmd.size() > cmd.find("chars") + 6 ? cmd.substr(cmd.find("chars") + 6) : "")) SendMessageW(g_view, WM_CHAR, c, 0);
+    } else if (o == "findnext" || o == "findprev") find_now(o == "findnext" ? 1 : -1);
+    else if (o == "findclose") find_close();
     else if (o == "hittest") {  // hittest X Y: what Windows is told about that point of the main window
         sscanf(cmd.c_str(), " %*s %d %d", &a, &b);
         POINT pt{a, b};
@@ -2354,7 +2588,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 (HMENU)ID_URL, g_inst, nullptr);
         SendMessageW(g_url, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search or type an address");
         g_url_proc = (WNDPROC)SetWindowLongPtrW(g_url, GWLP_WNDPROC, (LONG_PTR)url_proc);
-        g_view = CreateWindowExW(WS_EX_ACCEPTFILES, L"LowWebView", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10,
+        g_view = CreateWindowExW(WS_EX_ACCEPTFILES, L"LowWebView", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS, 0, 0, 10, 10,
                                  hwnd, nullptr, g_inst, nullptr);
         make_fonts();
         update_engine_button();
@@ -2495,6 +2729,9 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Tab &t = T();
             if (t.page && !t.page->crashed && t.page->f_frame >= 0) page_call(t, t.page->f_frame, {wasm::from_f64(steady_ms() - t.page->t0)});
         }
+        if (wp == TIMER_FRAME && find_open_now() && !g_tabs.empty() && T().id == g_find_tab && g_find_status >= 0 &&
+            !showing_doc(T()))
+            find_show_status(find_in(T(), L"", 3));
         if (wp == TIMER_SCRIPT) script_step();
         if (wp == TIMER_SLEEP) sleep_tabs();
         return 0;

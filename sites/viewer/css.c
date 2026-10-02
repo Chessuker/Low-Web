@@ -1,5 +1,6 @@
-// css.c — the part of CSS the viewer uses: which elements are hidden.
-// Included by viewer.c (not compiled on its own).
+// css.c — the part of CSS the viewer uses: which elements are hidden, and the properties
+// that place boxes (display: flex/grid/block/inline, float, clear, widths, flex and grid
+// settings, gaps). Included by viewer.c (not compiled on its own).
 //
 // Modern pages hide menus, dialogs and dropdowns with stylesheets; without this the reader
 // view would show all of them. We parse <style> and <link rel=stylesheet>, evaluate @media
@@ -27,19 +28,44 @@ struct Compound {
     u8 comb;                 // combinator to the next compound on the LEFT: ' ', '>', '+', '~', 0 = none
 };
 
+// Layout properties. Each has a value (lval: x100 for lengths and numbers) and a unit.
+enum { LP_FLOAT, LP_CLEAR, LP_WIDTH, LP_MAXW, LP_DIR, LP_WRAP, LP_JUSTIFY, LP_ALIGN, LP_RGAP, LP_CGAP,
+       LP_GROW, LP_SHRINK, LP_BASIS, LP_COLS, LP_SPAN, LP_MINW, LP_OVER, LP_COUNT };  // LP_OVER: overflow-x, 1 visible, 2 clipped
+enum { U_PX = 1, U_EM, U_REM, U_PCT, U_AUTO, U_NUM, U_STR, U_VW };  // U_STR: lval is a string (grid-template-columns)
+enum { LD_BLOCK = 1, LD_INLINE, LD_INLINE_BLOCK, LD_FLEX, LD_GRID, LD_OTHER };  // display, besides none
+// Properties that matter only for a float, a flex or grid container, or an item in one: looked
+// up when one asks (lay_items), not for every element (matching all the rules that set
+// widths, gaps and the like for every element costs ~15% of the layout of a big page).
+// Every element needs only display, float and clear.
+#define LP_ITEM_MASK (((1u << LP_COUNT) - 1) & ~((1u << LP_FLOAT) | (1u << LP_CLEAR)))
+
 // What a rule's declarations say. 0 = not set.
 typedef struct {
     u8 disp;       // 1 none, 2 anything else
     u8 vis;        // 1 hidden/collapse, 2 visible
     u8 sr;         // 1 = visually hidden (clip, off-screen)
     u8 imp_disp, imp_vis;
+    u8 ldisp;      // with disp (the same property): LD_*
+    u8 lhas[LP_COUNT];  // 1 set, 2 set !important
+    u8 lunit[LP_COUNT];
+    int lval[LP_COUNT];
 } Decl;
+
+// An element's computed layout properties (only made for elements that have some).
+typedef struct Lay {
+    u8 disp;            // LD_*, 0 = what its tag says
+    u8 items_done;      // the LP_ITEM_MASK properties are in (lay_items)
+    u8 has[LP_COUNT];
+    u8 unit[LP_COUNT];
+    int val[LP_COUNT];
+} Lay;
 
 typedef struct {
     Compound *parts;  // right to left
     int nparts;
     int spec;         // specificity a*10000 + b*100 + c
     int order;
+    u32 lmask;        // the layout properties it sets (1 << LP_*)
     Decl d;
     u8 has_need;
     u64 need[4];      // ancestor Bloom bits this rule's ancestor compounds require (see anc_bloom)
@@ -299,6 +325,9 @@ static void add_selector(const char *s, const char *e, const Decl *d, int order)
     r->spec = spec;
     r->order = order;
     r->d = *d;
+    r->lmask = 0;
+    for (int i = 0; i < LP_COUNT; i++)
+        if (d->lhas[i]) r->lmask |= 1u << i;
     __builtin_memset(r->need, 0, sizeof r->need);
     r->has_need = 0;
     int ancestor = 0;
@@ -410,6 +439,51 @@ static const char *block_end(const char *s, const char *e) {
 
 static int value_is(const char *v, const char *e, const char *word) { return iprefix(v, (int)(e - v), word); }
 
+// A number with its unit ("12px", "1.5em", "50%", "2fr", "0", "auto") at *p; 0 if none.
+static int read_len(const char **p, const char *e, int *val, u8 *unit) {
+    const char *q = *p;
+    while (q < e && is_space((u8)*q)) q++;
+    if (q < e && value_is(q, e, "auto")) { *val = 0; *unit = U_AUTO; *p = q + 4; return 1; }
+    int neg = 0;
+    if (q < e && (*q == '-' || *q == '+')) neg = *q++ == '-';
+    long long v = 0;
+    int digits = 0, fd = 0;  // the value x100: two digits after the point
+    while (q < e && is_digit((u8)*q)) { if (v < 100000000) v = v * 10 + (*q - '0'); digits++; q++; }
+    if (q < e && *q == '.') {
+        q++;
+        while (q < e && is_digit((u8)*q)) { if (fd < 2) { v = v * 10 + (*q - '0'); fd++; } digits++; q++; }
+    }
+    if (!digits) return 0;
+    while (fd < 2) { v *= 10; fd++; }
+    if (v > 100000000) v = 100000000;
+    *val = (int)(neg ? -v : v);
+    u8 u = U_NUM;
+    if (value_is(q, e, "px")) { u = U_PX; q += 2; }
+    else if (value_is(q, e, "rem")) { u = U_REM; q += 3; }
+    else if (value_is(q, e, "em")) { u = U_EM; q += 2; }
+    else if (value_is(q, e, "fr")) { u = U_NUM; q += 2; }
+    else if (q < e && *q == '%') { u = U_PCT; q++; }
+    else if (value_is(q, e, "pt")) { u = U_PX; *val = *val * 4 / 3; q += 2; }
+    else if (value_is(q, e, "vw")) { u = U_VW; q += 2; }
+    else if (value_is(q, e, "vh") || value_is(q, e, "ch") || value_is(q, e, "ex")) { u = U_AUTO; q += 2; }
+    while (q < e && is_alnum((u8)*q)) q++;  // a unit we don't know
+    *unit = u;
+    *p = q;
+    return 1;
+}
+
+static void set_lp(Decl *d, int prop, int val, u8 unit, int imp) {
+    d->lval[prop] = val;
+    d->lunit[prop] = unit;
+    d->lhas[prop] = (u8)(imp ? 2 : 1);
+}
+
+static int keyword(const char *v, const char *e, const char *const *words, int n) {  // 1 + index, 0 = none
+    for (int i = 0; i < n; i++)
+        if (value_is(v, e, words[i])) return i + 1;
+    return 0;
+}
+
 // Reads a declaration block (or a style="" attribute) for the properties we care about.
 static void scan_decls(const char *s, const char *e, Decl *d) {
     __builtin_memset(d, 0, sizeof *d);
@@ -436,9 +510,111 @@ static void scan_decls(const char *s, const char *e, Decl *d) {
         for (const char *q = vs; q < ve; q++)
             if (*q == '!') imp = 1;
         int nl = (int)(ne - ns);
+        int vl = (int)(ve - vs), val;
+        u8 unit;
+        const char *q = vs;
+        if (imp) {  // the value without "!important"
+            const char *bang = vs;
+            while (bang < ve && *bang != '!') bang++;
+            ve = bang;
+            while (ve > vs && is_space((u8)ve[-1])) ve--;
+            vl = (int)(ve - vs);
+        }
+        (void)vl;
         if (nl == 7 && iprefix(ns, 7, "display")) {
             d->disp = value_is(vs, ve, "none") ? 1 : 2;
             d->imp_disp = (u8)imp;
+            static const char *const kinds[] = {"inline-flex", "inline-grid", "inline-block", "inline", "block", "flex", "grid", "list-item", "flow-root"};
+            static const u8 as[] = {LD_FLEX, LD_GRID, LD_INLINE_BLOCK, LD_INLINE, LD_BLOCK, LD_FLEX, LD_GRID, LD_BLOCK, LD_BLOCK};
+            int k = keyword(vs, ve, kinds, 9);
+            d->ldisp = k ? as[k - 1] : LD_OTHER;
+        } else if (nl == 5 && iprefix(ns, 5, "float")) {
+            static const char *const w[] = {"none", "left", "right", "inline-start", "inline-end"};
+            static const u8 as[] = {1, 2, 3, 2, 3};
+            int k = keyword(vs, ve, w, 5);
+            if (k) set_lp(d, LP_FLOAT, as[k - 1], U_NUM, imp);
+        } else if (nl == 5 && iprefix(ns, 5, "clear")) {
+            static const char *const w[] = {"none", "left", "right", "both", "inline-start", "inline-end"};
+            static const u8 as[] = {1, 2, 3, 4, 2, 3};
+            int k = keyword(vs, ve, w, 6);
+            if (k) set_lp(d, LP_CLEAR, as[k - 1], U_NUM, imp);
+        } else if ((nl == 5 && iprefix(ns, 5, "width")) || (nl == 9 && iprefix(ns, 9, "max-width")) || (nl == 10 && iprefix(ns, 10, "flex-basis"))) {
+            if (read_len(&q, ve, &val, &unit)) set_lp(d, nl == 5 ? LP_WIDTH : nl == 9 ? LP_MAXW : LP_BASIS, val, unit, imp);
+        } else if (nl == 9 && iprefix(ns, 9, "min-width")) {
+            if (read_len(&q, ve, &val, &unit) && unit != U_PCT) set_lp(d, LP_MINW, val, unit, imp);
+        } else if ((nl == 8 && iprefix(ns, 8, "overflow")) || (nl == 10 && iprefix(ns, 10, "overflow-x"))) {
+            static const char *const w[] = {"visible", "hidden", "auto", "scroll", "clip"};
+            int k = keyword(vs, ve, w, 5);  // (overflow: a b — the first is x)
+            if (k) set_lp(d, LP_OVER, k == 1 ? 1 : 2, U_NUM, imp);
+        } else if ((nl == 14 && iprefix(ns, 14, "flex-direction")) || (nl == 9 && iprefix(ns, 9, "flex-wrap")) || (nl == 9 && iprefix(ns, 9, "flex-flow"))) {
+            for (const char *t = vs; t < ve; t++) {  // flex-flow has both, in any order
+                if (t > vs && !is_space((u8)t[-1])) continue;
+                if (value_is(t, ve, "column")) set_lp(d, LP_DIR, 2, U_NUM, imp);
+                else if (value_is(t, ve, "row")) set_lp(d, LP_DIR, 1, U_NUM, imp);
+                else if (value_is(t, ve, "nowrap")) set_lp(d, LP_WRAP, 1, U_NUM, imp);
+                else if (value_is(t, ve, "wrap")) set_lp(d, LP_WRAP, 2, U_NUM, imp);
+            }
+        } else if (nl == 15 && iprefix(ns, 15, "justify-content")) {
+            static const char *const w[] = {"flex-start", "start", "left", "normal", "stretch", "center", "flex-end", "end", "right",
+                                            "space-between", "space-around", "space-evenly"};
+            static const u8 as[] = {1, 1, 1, 1, 1, 2, 3, 3, 3, 4, 5, 6};
+            int k = keyword(vs, ve, w, 12);
+            if (k) set_lp(d, LP_JUSTIFY, as[k - 1], U_NUM, imp);
+        } else if (nl == 11 && iprefix(ns, 11, "align-items")) {
+            static const char *const w[] = {"stretch", "normal", "flex-start", "start", "self-start", "baseline", "center", "flex-end", "end", "self-end"};
+            static const u8 as[] = {1, 1, 2, 2, 2, 2, 3, 4, 4, 4};
+            int k = keyword(vs, ve, w, 10);
+            if (k) set_lp(d, LP_ALIGN, as[k - 1], U_NUM, imp);
+        } else if ((nl == 3 && iprefix(ns, 3, "gap")) || (nl == 8 && iprefix(ns, 8, "grid-gap"))) {
+            if (read_len(&q, ve, &val, &unit)) {
+                set_lp(d, LP_RGAP, val, unit, imp);
+                set_lp(d, LP_CGAP, val, unit, imp);
+                if (read_len(&q, ve, &val, &unit)) set_lp(d, LP_CGAP, val, unit, imp);
+            }
+        } else if ((nl == 7 && iprefix(ns, 7, "row-gap")) || (nl == 13 && iprefix(ns, 13, "grid-row-gap"))) {
+            if (read_len(&q, ve, &val, &unit)) set_lp(d, LP_RGAP, val, unit, imp);
+        } else if ((nl == 10 && iprefix(ns, 10, "column-gap")) || (nl == 15 && iprefix(ns, 15, "grid-column-gap"))) {
+            if (read_len(&q, ve, &val, &unit)) set_lp(d, LP_CGAP, val, unit, imp);
+        } else if (nl == 9 && iprefix(ns, 9, "flex-grow")) {
+            if (read_len(&q, ve, &val, &unit)) set_lp(d, LP_GROW, val, U_NUM, imp);
+        } else if (nl == 11 && iprefix(ns, 11, "flex-shrink")) {
+            if (read_len(&q, ve, &val, &unit)) set_lp(d, LP_SHRINK, val, U_NUM, imp);
+        } else if (nl == 4 && iprefix(ns, 4, "flex")) {  // none | auto | grow [shrink] [basis]
+            if (value_is(vs, ve, "none")) { set_lp(d, LP_GROW, 0, U_NUM, imp); set_lp(d, LP_SHRINK, 0, U_NUM, imp); set_lp(d, LP_BASIS, 0, U_AUTO, imp); }
+            else if (value_is(vs, ve, "auto")) { set_lp(d, LP_GROW, 100, U_NUM, imp); set_lp(d, LP_SHRINK, 100, U_NUM, imp); set_lp(d, LP_BASIS, 0, U_AUTO, imp); }
+            else if (read_len(&q, ve, &val, &unit)) {
+                if (unit != U_NUM) { set_lp(d, LP_BASIS, val, unit, imp); }
+                else {
+                    set_lp(d, LP_GROW, val, U_NUM, imp);
+                    set_lp(d, LP_SHRINK, 100, U_NUM, imp);
+                    set_lp(d, LP_BASIS, 0, U_PX, imp);  // "flex: 1" is basis 0
+                    if (read_len(&q, ve, &val, &unit)) {
+                        if (unit == U_NUM) {
+                            set_lp(d, LP_SHRINK, val, U_NUM, imp);
+                            if (read_len(&q, ve, &val, &unit)) set_lp(d, LP_BASIS, val, unit, imp);
+                        } else set_lp(d, LP_BASIS, val, unit, imp);
+                    }
+                }
+            }
+        } else if (nl == 21 && iprefix(ns, 21, "grid-template-columns")) {
+            if (!value_is(vs, ve, "none") && !value_is(vs, ve, "subgrid") && !value_is(vs, ve, "masonry"))
+                set_lp(d, LP_COLS, (int)(unsigned long)arena_str(vs, (int)(ve - vs)), U_STR, imp);
+        } else if ((nl == 11 && iprefix(ns, 11, "grid-column")) || (nl == 15 && iprefix(ns, 15, "grid-column-end"))) {
+            const char *t = vs;
+            while (t < ve && *t != '/') t++;
+            int a = parse_int(vs, 0), span = 0;
+            if (value_is(vs, ve, "span")) { q = vs + 4; if (read_len(&q, ve, &val, &unit)) span = val / 100; }
+            else if (t < ve) {
+                const char *b = t + 1;
+                while (b < ve && is_space((u8)*b)) b++;
+                if (value_is(b, ve, "span")) { q = b + 4; if (read_len(&q, ve, &val, &unit)) span = val / 100; }
+                else {
+                    int neg = *b == '-', end = parse_int(neg ? b + 1 : b, 0);
+                    if (neg && end == 1) span = -1;  // to the last line: the whole row
+                    else if (a > 0 && end > a) span = end - a;
+                }
+            }
+            if (span) set_lp(d, LP_SPAN, span, U_NUM, imp);
         } else if (nl == 10 && iprefix(ns, 10, "visibility")) {
             d->vis = value_is(vs, ve, "hidden") || value_is(vs, ve, "collapse") ? 1 : 2;
             d->imp_vis = (u8)imp;
@@ -504,7 +680,9 @@ static void parse_rules(const char *s, const char *e, int base_order) {
         const char *be = block_end(p, e);
         Decl d;
         scan_decls(p + 1, be, &d);
-        if (d.disp || d.vis || d.sr) {
+        int lay = 0;
+        for (int i = 0; i < LP_COUNT; i++) lay |= d.lhas[i];
+        if (d.disp || d.vis || d.sr || lay) {
             int order = base_order + css_order++;
             const char *a = sel;
             int depth = 0;
@@ -635,8 +813,10 @@ static int match_from(Node *n, const Rule *r, int i) {
 // Rules indexed by what their rightmost compound needs: an id, a class, a tag, or nothing.
 typedef struct { const char *key; int rule, next; } Bucket;
 #define CSS_HASH 4096
-static int *css_heads;       // CSS_HASH heads for id/class keys
-static int tag_heads[T_COUNT + 1], any_head = -1;
+// Two indexes: [0] the rules every element needs (display, visibility, float, clear), [1] the
+// rules with LP_ITEM_MASK properties (lay_items). A rule with both kinds is in both.
+static int *css_heads[2];    // CSS_HASH heads for id/class keys
+static int tag_heads[2][T_COUNT + 1], any_head[2] = {-1, -1};
 static Bucket *buckets;
 static int nbuckets, buckets_cap;
 
@@ -654,25 +834,34 @@ static void bucket_add(int *head, const char *key, int rule) {
     *head = nbuckets++;
 }
 
-static void index_rule(int i) {
+static void index_rule(int i, int set) {
     const Compound *k = &rules[i].parts[0];
     if (k->impossible) return;
-    if (k->id) bucket_add(&css_heads[key_hash(k->id, 1)], k->id, i);
-    else if (k->nclasses) bucket_add(&css_heads[key_hash(k->classes[0], 2)], k->classes[0], i);
-    else if (k->tag >= 0) bucket_add(&tag_heads[k->tag], 0, i);
-    else bucket_add(&any_head, 0, i);
+    if (k->id) bucket_add(&css_heads[set][key_hash(k->id, 1)], k->id, i);
+    else if (k->nclasses) bucket_add(&css_heads[set][key_hash(k->classes[0], 2)], k->classes[0], i);
+    else if (k->tag >= 0) bucket_add(&tag_heads[set][k->tag], 0, i);
+    else bucket_add(&any_head[set], 0, i);
+}
+
+static void index_both(int i) {  // into the index(es) of what it sets
+    const Rule *r = &rules[i];
+    if (r->d.disp || r->d.vis || r->d.sr || (r->lmask & ~LP_ITEM_MASK)) index_rule(i, 0);
+    if (r->lmask & LP_ITEM_MASK) index_rule(i, 1);
 }
 
 static void index_rules(void) {
-    if (!css_heads) css_heads = (int *)must_alloc(CSS_HASH * sizeof(int));
-    for (int i = 0; i < CSS_HASH; i++) css_heads[i] = -1;
-    for (int i = 0; i <= T_COUNT; i++) tag_heads[i] = -1;
-    any_head = -1;
+    for (int set = 0; set < 2; set++) {
+        if (!css_heads[set]) css_heads[set] = (int *)must_alloc(CSS_HASH * sizeof(int));
+        for (int i = 0; i < CSS_HASH; i++) css_heads[set][i] = -1;
+        for (int i = 0; i <= T_COUNT; i++) tag_heads[set][i] = -1;
+        any_head[set] = -1;
+    }
     nbuckets = 0;
-    for (int i = 0; i < nrules; i++) index_rule(i);
+    for (int i = 0; i < nrules; i++) index_both(i);
 }
 
-static int best_disp, best_vis, sr_hit;
+static int best_disp, best_vis, sr_hit, best_lp[LP_COUNT];
+static int item_pass;  // the cascade is looking up the LP_ITEM_MASK properties (else all but them)
 static const u64 *cur_anc;  // anc_bloom of the element being styled
 
 static int beats(const Rule *r, int imp, int best, int best_imp) {
@@ -684,10 +873,15 @@ static int beats(const Rule *r, int imp, int best, int best_imp) {
 
 static void consider_rule(Node *n, int ri) {
     const Rule *r = &rules[ri];
-    int want_disp = r->d.disp && beats(r, r->d.imp_disp, best_disp, best_disp >= 0 ? rules[best_disp].d.imp_disp : 0);
-    int want_vis = r->d.vis && beats(r, r->d.imp_vis, best_vis, best_vis >= 0 ? rules[best_vis].d.imp_vis : 0);
-    int want_sr = r->d.sr && !sr_hit;
-    if (!want_disp && !want_vis && !want_sr) return;
+    u32 lm = r->lmask & (item_pass ? LP_ITEM_MASK : ~LP_ITEM_MASK);
+    if (!lm && (item_pass || (!r->d.disp && !r->d.vis && !r->d.sr))) return;  // nothing this pass looks for
+    int want_disp = !item_pass && r->d.disp && beats(r, r->d.imp_disp, best_disp, best_disp >= 0 ? rules[best_disp].d.imp_disp : 0);
+    int want_vis = !item_pass && r->d.vis && beats(r, r->d.imp_vis, best_vis, best_vis >= 0 ? rules[best_vis].d.imp_vis : 0);
+    int want_sr = !item_pass && r->d.sr && !sr_hit;
+    u32 want_lp = 0;
+    for (int i = 0; lm; i++, lm >>= 1)
+        if ((lm & 1) && beats(r, r->d.lhas[i] == 2, best_lp[i], best_lp[i] >= 0 ? rules[best_lp[i]].d.lhas[i] == 2 : 0)) want_lp |= 1u << i;
+    if (!want_disp && !want_vis && !want_sr && !want_lp) return;
     if (r->has_need) {
         for (int i = 0; i < 4; i++)
             if ((cur_anc[i] & r->need[i]) != r->need[i]) return;
@@ -696,6 +890,8 @@ static void consider_rule(Node *n, int ri) {
     if (want_disp) best_disp = ri;
     if (want_vis) best_vis = ri;
     if (want_sr) sr_hit = 1;
+    for (int i = 0; i < LP_COUNT; i++)
+        if (want_lp & (1u << i)) best_lp[i] = ri;
 }
 
 static void consider(Node *n, int b) {
@@ -703,7 +899,7 @@ static void consider(Node *n, int b) {
 }
 
 static void consider_key(Node *n, const char *key, int kind) {
-    for (int b = css_heads[key_hash(key, kind)]; b >= 0; b = buckets[b].next) {
+    for (int b = css_heads[item_pass][key_hash(key, kind)]; b >= 0; b = buckets[b].next) {
         const char *a = buckets[b].key, *c = key;
         if (kind == 1) { if (!ieq(a, c)) continue; }
         else {  // classes are case-sensitive
@@ -717,8 +913,9 @@ static void consider_key(Node *n, const char *key, int kind) {
 // Runs the cascade for one element. Elements are styled lazily, when layout first asks
 // about them (css_hidden below): matching every element up front costs more than the
 // whole layout on big pages, and most of a page is often never laid out (reader view).
-static int css_node(Node *c) {
+static void cascade(Node *c) {  // the rules that match c, by id, class, tag, any
         best_disp = best_vis = -1;
+        for (int i = 0; i < LP_COUNT; i++) best_lp[i] = -1;
         cur_anc = any_need ? anc_bloom(c) : bloom_none;
         sr_hit = 0;
         const char *id = attr(c, "id");
@@ -735,22 +932,80 @@ static int css_node(Node *c) {
                 if (k) consider_key(c, one, 2);
             }
         }
-        consider(c, tag_heads[c->tag]);
-        consider(c, any_head);
+        consider(c, tag_heads[item_pass][c->tag]);
+        consider(c, any_head[item_pass]);
+}
+
+static int css_node(Node *c) {
+        item_pass = 0;
+        cascade(c);
         int disp = best_disp >= 0 ? rules[best_disp].d.disp : 0;
         int vis = best_vis >= 0 ? rules[best_vis].d.vis : 0;
+        Lay lay;
+        __builtin_memset(&lay, 0, sizeof lay);
+        int any = 0;
+        if (best_disp >= 0) lay.disp = rules[best_disp].d.ldisp;
+        for (int i = 0; i < LP_COUNT; i++)
+            if (best_lp[i] >= 0) {
+                const Decl *d = &rules[best_lp[i]].d;
+                lay.has[i] = 1; lay.unit[i] = d->lunit[i]; lay.val[i] = d->lval[i];
+                any = 1;
+            }
         const char *st = attr(c, "style");  // style="" beats stylesheet rules that aren't !important
         if (st) {
             Decl in;
             scan_decls(st, st + lw_strlen(st), &in);
-            if (in.disp && !(best_disp >= 0 && rules[best_disp].d.imp_disp)) disp = in.disp;
+            if (in.disp && !(best_disp >= 0 && rules[best_disp].d.imp_disp)) { disp = in.disp; lay.disp = in.ldisp; }
             if (in.vis && !(best_vis >= 0 && rules[best_vis].d.imp_vis)) vis = in.vis;
             if (in.sr) sr_hit = 1;
+            for (int i = 0; i < LP_COUNT; i++)
+                if (in.lhas[i] && !(best_lp[i] >= 0 && rules[best_lp[i]].d.lhas[i] == 2)) {
+                    lay.has[i] = 1; lay.unit[i] = in.lunit[i]; lay.val[i] = in.lval[i];
+                    any = 1;
+                }
+        }
+        c->lay = 0;
+        if (any || lay.disp) {
+            c->lay = (Lay *)arena(sizeof(Lay));
+            *c->lay = lay;
         }
         return disp == 1 || vis == 1 || sr_hit;
 }
 
 static u8 css_epoch;  // bumped whenever the rules change; nodes styled in an older epoch are stale
+static int css_hidden(Node *n);
+
+// c's LP_ITEM_MASK properties (width, max-width, flex and grid ones, overflow), for a float,
+// a flex or grid container or item. Returns c's Lay (made if it had none), or 0 for a text node.
+static Lay *lay_items(Node *c) {
+    if (c->type != N_ELEM) return 0;
+    css_hidden(c);  // (the rest of the cascade first: it makes c->lay anew when the rules change)
+    if (c->lay && c->lay->items_done) return c->lay;
+    if (!c->lay) {
+        c->lay = (Lay *)arena(sizeof(Lay));
+        __builtin_memset(c->lay, 0, sizeof(Lay));
+    }
+    Lay *l = c->lay;
+    item_pass = 1;
+    cascade(c);
+    item_pass = 0;
+    for (int i = 0; i < LP_COUNT; i++)
+        if ((LP_ITEM_MASK & (1u << i)) && best_lp[i] >= 0) {
+            const Decl *d = &rules[best_lp[i]].d;
+            l->has[i] = 1; l->unit[i] = d->lunit[i]; l->val[i] = d->lval[i];
+        }
+    const char *st = attr(c, "style");
+    if (st) {
+        Decl in;
+        scan_decls(st, st + lw_strlen(st), &in);
+        for (int i = 0; i < LP_COUNT; i++)
+            if ((LP_ITEM_MASK & (1u << i)) && in.lhas[i] && !(best_lp[i] >= 0 && rules[best_lp[i]].d.lhas[i] == 2)) {
+                l->has[i] = 1; l->unit[i] = in.lunit[i]; l->val[i] = in.lval[i];
+            }
+    }
+    l->items_done = 1;
+    return l;
+}
 
 static void css_reset(Node *n) {
     for (Node *c = n->first; c; c = c->next) {
@@ -809,7 +1064,7 @@ static void css_add_sheet(int i) {
     if (m && !media_matches(m, m + lw_strlen(m))) return;
     int first = nrules;
     parse_rules(sheet_text[i], sheet_text[i] + sheet_len[i], i << 20);
-    for (int r = first; r < nrules; r++) index_rule(r);
+    for (int r = first; r < nrules; r++) index_both(r);
     if (nrules > first) {
         css_bump();
         css_new_rules = 1;

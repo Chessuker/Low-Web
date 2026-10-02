@@ -85,6 +85,9 @@ TESTS = [
     ('access', script('tests/check_access.py')),
     ('sleep', script('tests/check_sleep.py')),
     ('select', script('tests/check_select.py')),
+    ('edit', script('tests/check_edit.py')),
+    ('progressive', script('tests/check_progressive.py')),
+    ('css', script('tests/check_css_layout.py')),
 ]
 
 only = sys.argv[1:]
@@ -97,7 +100,7 @@ for name, fn in TESTS:
         ok, out = fn()
     except Exception as e:  # a missing tool, a timeout ...
         ok, out = False, repr(e)
-    print('%-8s %s  (%.1f s)' % (name, 'ok' if ok else 'FAILED', time.time() - t0), flush=True)
+    print('%-11s %s  (%.1f s)' % (name, 'ok' if ok else 'FAILED', time.time() - t0), flush=True)
     if not ok:
         failed.append(name)
         print('    ' + out.strip().replace('\n', '\n    '), flush=True)
