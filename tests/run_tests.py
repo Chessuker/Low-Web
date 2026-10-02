@@ -90,6 +90,7 @@ TESTS = [
     ('css', script('tests/check_css_layout.py')),
     ('video', script('tests/check_video.py')),
     ('history', script('tests/check_history.py')),
+    ('referer', script('tests/check_referer.py')),
 ]
 
 only = sys.argv[1:]

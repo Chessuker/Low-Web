@@ -113,6 +113,9 @@ bin\lowweb.exe https://th.wikipedia.org/wiki/ภาษาไทย   :: เว�
 - **Cookie** (RFC 6265): `Domain`, `Path`, `Secure`, `HttpOnly`, `Max-Age`/`Expires`, `SameSite` (ไม่บอก = `Lax`),
   prefix `__Host-`/`__Secure-`, ห้ามตั้งให้ public suffix (`.com`, `.co.th` …); **cookie ของเว็บอื่น (third-party) ไม่ส่งและไม่เก็บ**;
   cookie ที่มีวันหมดอายุเก็บไว้ที่ `%LOCALAPPDATA%\Low-web\cookies.txt` ส่วน session cookie หายเมื่อปิด browser
+- **User-Agent** แบบ Chrome ต่อท้ายด้วย `Low-web/0.1` (เว็บที่กันบอทหรือ CDN ไม่บล็อก; DuckDuckGo html เดิมตอบหน้า bot check) และ **Referer** แบบค่าตั้งต้นของ browser
+  (`strict-origin-when-cross-origin`: origin เดียวกันได้ที่อยู่เต็ม, ต่าง origin ได้แค่ origin, HTTPS → HTTP / file / ที่อยู่ที่พิมพ์เองไม่ส่ง):
+  วิดีโอและรูปจากเว็บที่กัน hotlink จึงไม่ได้ 403 อีก; ยังไม่อ่าน `Referrer-Policy` / `<meta name=referrer>` ของหน้า
 - **HTTP cache**: ทำตาม `Cache-Control` (`max-age`, `no-cache`, `no-store`), `Expires`, `ETag`/`If-None-Match`,
   `Last-Modified`/`If-Modified-Since` (ถ้า server ไม่บอกอายุ ใช้กฎ 10% ของ `Last-Modified` ไม่เกิน 1 วัน)
   เก็บในหน่วยความจำ 16 MB (ไฟล์ละไม่เกิน 2 MB) และในดิสก์ที่ `%LOCALAPPDATA%\Low-web\Cache` ไม่เกิน 256 MB (ไฟล์ที่ไม่ได้ใช้นานที่สุดถูกลบก่อน)
@@ -228,7 +231,8 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
 
 | คำสั่ง | ทดสอบอะไร |
 |---|---|
-| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css, video, history) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css, video, history, referer) ตามที่ CI รัน: ควรรันก่อน commit |
+| `python tests/check_referer.py` | header ที่ browser ส่ง (server ทดสอบ 2 port = 2 origin): User-Agent แบบ Chrome + `Low-web/0.1`, Referer แบบค่าตั้งต้นของ browser (`strict-origin-when-cross-origin`): origin เดียวกันได้ที่อยู่เต็ม (ไม่มี #fragment), ต่าง origin ได้แค่ origin, ที่อยู่ที่พิมพ์เองไม่มี Referer |
 | `python tests/check_history.py` | ประวัติ back/forward: ลิงก์ที่ผู้ใช้คลิกเพิ่มรายการ แต่หน้าที่พาไปต่อเอง (`<meta refresh>` แบบหน้า redirect ของ search engine) แทนที่รายการของตัวเอง กด Back จึงกลับไปหน้าค้นหาได้ ไม่วนกลับมาหน้าเดิม |
 | `python tests/check_video.py` | วิดีโอ (`tests/samples/colors.mp4`: แดง เขียว น้ำเงิน เหลือง อย่างละวินาที จึงดูจากภาพได้ว่าอยู่วินาทีไหน): คลิกเล่น, Space หยุด, คลิกแถบเลื่อนไป 85%, เล่นจนจบ, F เต็มจอ / Esc ออก, `<audio>`, ไฟล์ที่ไม่มีบอกเหตุผลบนภาพ, และผ่าน HTTP ช้า ๆ (`slow_server.py`) ที่ข้อมูลภาพอยู่ห่างจากต้นไฟล์ 3 MB ต้องขอเป็น range; SKIP ถ้า Windows ไม่มี Media Foundation หรือเครื่องไม่มีอุปกรณ์เสียง |
 | `python tests/check_css_layout.py` | CSS จัดหน้าจาก stylesheet: หน้ากล่องสี (flex แถว 1:2 + กว้างคงที่ + gap, float ขวา + ข้อความไหลรอบ + clear, grid 3 คอลัมน์, carousel ใน `overflow:hidden`, `justify-content:center`) แล้วหากล่องจากสีในภาพ |

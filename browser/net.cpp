@@ -320,6 +320,26 @@ Response from_cache(const cache::Entry &e, std::string &location) {
     return r;
 }
 
+// What we call ourselves: Chrome's form (sites that check for a "real browser" — bot walls,
+// CDNs, video hosts — let it through; DuckDuckGo answers an unknown one with a bot check),
+// and our own name at the end, as Edge adds "Edg/".
+const char *const kUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Low-web/0.1";
+
+// The Referer header for a request made for page `from` (a link's or a form's page, or the page
+// a subresource is for), as browsers send it by default ("strict-origin-when-cross-origin"):
+// the page's address (without its #fragment) to its own origin; just the origin to others;
+// nothing from HTTPS to HTTP, from a file, or for an address the user typed (from = "").
+// Video hosts and CDNs often refuse files asked for without one (403: hotlink protection).
+std::string referrer_for(const std::string &from, const Url &to) {
+    Url f;
+    if (from.empty() || !f.parse(from) || (f.scheme != "http" && f.scheme != "https")) return "";
+    if (f.scheme == "https" && to.scheme != "https") return "";
+    std::string origin = f.origin();  // "https://host/"
+    if (origin != to.origin()) return origin;
+    return origin.substr(0, origin.size() - 1) + percent_encode_path(f.path);
+}
+
 // One HTTP/1.1 request, through the cache and on a pooled connection if there is one.
 // Sets `location` for redirects.
 // A pages sees a cached copy only if it was made for the same cookies ("Vary: Cookie").
@@ -339,6 +359,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     cookies::Context ctx = who ? *who : cookies::Context{};
     ctx.unsafe_method = post != nullptr;
     const std::string cookie = cookies::header_for(url, ctx);
+    const std::string referer = who ? referrer_for(who->site_for, u) : "";
 
     // ---- the cache: fresh enough to use as it is? else ask "has it changed?"
     cache::Entry cached;
@@ -366,7 +387,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     if (u.port != default_port(u.scheme)) host_hdr += ":" + std::to_string(u.port);
     std::string req = std::string(post ? "POST " : "GET ") + percent_encode_path(target) + " HTTP/1.1\r\n"
                       "Host: " + host_hdr + "\r\n"
-                      "User-Agent: Low-web/0.1\r\n"
+                      "User-Agent: " + std::string(kUserAgent) + "\r\n"
                       "Accept: " + std::string(mode == Mode::Page
                                                    ? "application/wasm, text/html;q=0.9, text/plain;q=0.8, image/*;q=0.8, */*;q=0.5"
                                                    : "*/*") + "\r\n"
@@ -377,6 +398,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
     if (have && !cached.last_modified.empty()) req += "If-Modified-Since: " + cached.last_modified + "\r\n";
     if (cmode == CacheMode::Reload) req += "Cache-Control: no-cache\r\n";
     if (!cookie.empty()) req += "Cookie: " + cookie + "\r\n";
+    if (!referer.empty()) req += "Referer: " + referer + "\r\n";
     if (post)
         req += "Content-Type: application/x-www-form-urlencoded\r\n"
                "Content-Length: " + std::to_string(post->size()) + "\r\n\r\n" + *post;
@@ -460,7 +482,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         std::shared_ptr<h2::Connection> hc;
         std::shared_ptr<h2::Stream> st;
         h2::Headers hh = {{":method", post ? "POST" : "GET"}, {":scheme", "https"}, {":authority", host_hdr},
-                          {":path", percent_encode_path(target)}, {"user-agent", "Low-web/0.1"},
+                          {":path", percent_encode_path(target)}, {"user-agent", kUserAgent},
                           {"accept", mode == Mode::Page ? "application/wasm, text/html;q=0.9, text/plain;q=0.8, image/*;q=0.8, */*;q=0.5" : "*/*"},
                           {"accept-encoding", media ? "identity" : "gzip, deflate"}, {"accept-language", "th, en;q=0.8"}};
         if (media) hh.push_back({"range", "bytes=" + std::to_string(stream->range_from) + "-"});
@@ -468,6 +490,7 @@ Response http_request(const Url &u, Mode mode, size_t max_bytes, const std::stri
         if (have && !cached.last_modified.empty()) hh.push_back({"if-modified-since", cached.last_modified});
         if (cmode == CacheMode::Reload) hh.push_back({"cache-control", "no-cache"});
         if (!cookie.empty()) hh.push_back({"cookie", cookie});
+        if (!referer.empty()) hh.push_back({"referer", referer});
         if (post) {
             hh.push_back({"content-type", "application/x-www-form-urlencoded"});
             hh.push_back({"content-length", std::to_string(post->size())});
