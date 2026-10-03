@@ -145,12 +145,13 @@ try:
     # play, pause, look; seek to 85% (paused), look; play to the end
     seek_x = tr[0] + (tr[1] - tr[0]) * 85 // 100
     script = '; '.join([
-        'wait 800', 'click %d %d' % (cx, cy), 'wait 1300', 'key 32', 'wait 400', 'video', 'shot ' + os.path.join(work, 'paused.bmp'),
-        'click %d %d' % (seek_x, (v1[1] + v1[3]) // 2), 'wait 700', 'video', 'shot ' + os.path.join(work, 'seeked.bmp'),
-        'key 32', 'wait 1500', 'video',
+        'wait 800', 'click %d %d' % (cx, cy), 'waitvideo 1 2', 'wait 1300', 'key 32', 'waitvideo 1 1', 'wait 400', 'video',
+        'shot ' + os.path.join(work, 'paused.bmp'),
+        'click %d %d' % (seek_x, (v1[1] + v1[3]) // 2), 'wait 1500', 'video', 'shot ' + os.path.join(work, 'seeked.bmp'),
+        'key 32', 'waitvideo 1 3', 'video',
         'key 70', 'wait 800', 'shot ' + os.path.join(work, 'full.bmp'), 'key 27', 'wait 800', 'shot ' + os.path.join(work, 'back.bmp'),
-        'click %d %d' % (au[0] + 15, (au[1] + au[3]) // 2), 'wait 800', 'video',
-        'click %d %d' % ((v2[0] + v2[2]) // 2, v2[1] - 50), 'wait 1000', 'video', 'shot ' + os.path.join(work, 'missing.bmp')])
+        'click %d %d' % (au[0] + 15, (au[1] + au[3]) // 2), 'waitvideo 2 2', 'video',
+        'click %d %d' % ((v2[0] + v2[2]) // 2, v2[1] - 50), 'waitvideo 3 4', 'video', 'shot ' + os.path.join(work, 'missing.bmp')])
     log = run(base + 'page.html', script)
     st = states(log)
     if any('no sound device' in s[3] for s in st):  # (CI machines often have none)
@@ -192,8 +193,8 @@ try:
         try:
             time.sleep(0.5)
             log = run('http://127.0.0.1:%d/slow.html' % port, '; '.join([
-                'wait 800', 'click %d %d' % (cx, cy), 'wait 1500', 'video',
-                'click %d %d' % (seek_x, (v1[1] + v1[3]) // 2), 'wait 3500', 'video']))
+                'wait 800', 'click %d %d' % (cx, cy), 'waitvideo 1 2', 'wait 500', 'video',
+                'click %d %d' % (seek_x, (v1[1] + v1[3]) // 2), 'waitvideo 1 3 20000', 'video']))
         finally:
             server.kill()
     served = open(out).read()
@@ -201,7 +202,7 @@ try:
     check('over HTTP: data far past what has arrived is asked for from there (a range request)',
           len(starts) >= 2 and starts[0] == 0 and max(starts) > 2000000, served)
     st = states(log)
-    check('... and played from there', len(st) >= 2 and st[-1][1] in (2, 3) and st[-1][2] > 3.2, st)
+    check('... and played from there to the end', len(st) >= 2 and st[-1][1] == 3 and st[-1][2] > 3.2, st)
 finally:
     shutil.rmtree(work, ignore_errors=True)
 print('ALL OK' if not fails else '%d FAILED' % fails)

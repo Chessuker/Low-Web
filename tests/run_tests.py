@@ -3,7 +3,7 @@
 #   python tests/run_tests.py [NAME...]     (names: see TESTS below; default all)
 # Left out on purpose: tests/bench_viewer.py (downloads Wikipedia) and tests/check_svg.py
 # (renders with Edge and is judged by eye).
-import os, subprocess, sys, time
+import os, re, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
@@ -30,6 +30,7 @@ def ops():
         _, got = run([os.path.join(BIN, 'wasmrun.exe')] + flags + ['build/ops.wasm'] + calls)
         got = got.strip().splitlines()
         for w, g in zip(want, got):
+            g = re.sub(r'   \(\d+(\.\d+)? ms\)$', '', g)  # (wasmrun adds the time of a call that took over 5 ms)
             # trap messages are worded differently by V8; that it trapped is what counts
             same = w == g or ('-> trap:' in w and '-> trap:' in g and w.split('->')[0] == g.split('->')[0])
             ok &= same

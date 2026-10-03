@@ -2751,6 +2751,24 @@ void script_step() {
         for (int i = 0; i < (int)T().history.size(); i++) h += (i == T().hist_idx ? " *" : " ") + T().history[i];
         log_line(h);
     }
+    else if (o == "waitvideo") {  // waitvideo ID STATE [MS]: until that video is in that state (or failed), at most MS (15 s)
+        static double until = 0;
+        c = 0;
+        sscanf(cmd.c_str(), " %*s %d %d %d", &a, &b, &c);
+        if (!until) until = steady_ms() + (c > 0 ? c : 15000);
+        int state = -1;
+        if (T().page) {
+            auto it = T().page->videos.find(a);
+            if (it != T().page->videos.end()) state = it->second.player->info().state;
+        }
+        if (state == b || state == video::FAILED || steady_ms() > until) {
+            if (state != b) log_line("[script] waitvideo " + std::to_string(a) + ": state " + std::to_string(state) + ", not " + std::to_string(b));
+            until = 0;
+        } else {
+            g_script.push_front(cmd);  // again, a little later
+            g_script_wait_until = steady_ms() + 30;
+        }
+    }
     else if (o == "video") {  // what the page's videos are doing
         if (T().page)
             for (auto &[id, v] : T().page->videos) {
