@@ -1,4 +1,4 @@
-# CSS layout from stylesheets: flex rows, floats and clear, grids, a clipped carousel and
+# CSS layout from stylesheets: flex rows, floats and clear (a float that clears too), grids, a clipped carousel and
 # justify-content. Opens a page of coloured boxes in bin/lowweb.exe, takes a screenshot and
 # finds each box by its colour. Needs no internet (and Pillow).
 import os, shutil, subprocess, sys, tempfile
@@ -13,7 +13,7 @@ PAGE = '''<!doctype html><html><head><title>css</title><style>
 .row{display:flex;gap:10px}
 .a{flex:1} .b{flex:2} .c{width:100px}
 .fr{float:right;width:200px}
-.clr{clear:both}
+.clr{clear:both} .cr{clear:right}
 .g{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 .clip{overflow:hidden} .track{display:flex} .slide{flex-shrink:0;width:500px}
 .mid{display:flex;justify-content:center}
@@ -25,11 +25,16 @@ PAGE = '''<!doctype html><html><head><title>css</title><style>
 <div class=g><div style="background:#ffff00">1</div><div style="background:#ff8000">2</div><div style="background:#8000ff">3</div><div style="background:#008080">4</div></div>
 <div class=clip><div class=track><div class=slide style="background:#804000">one</div><div class=slide style="background:#004080">two</div></div></div>
 <div class=mid><div style="background:#ff0080">centred</div></div>
+<div class=fr style="background:#ff6060">tall<br>float<br>one<br>two</div>
+<p>Heading</p>
+<div class="fr cr" style="background:#60ff60">second</div>
+<div style="background:#6060ff">after</div>
 </body></html>'''
 
 COLOURS = {'red': (255, 0, 0), 'green': (0, 192, 0), 'blue': (0, 0, 255), 'float': (255, 0, 255), 'cleared': (0, 255, 255),
            'g1': (255, 255, 0), 'g2': (255, 128, 0), 'g3': (128, 0, 255), 'g4': (0, 128, 128),
-           'slide1': (128, 64, 0), 'slide2': (0, 64, 128), 'centred': (255, 0, 128)}
+           'slide1': (128, 64, 0), 'slide2': (0, 64, 128), 'centred': (255, 0, 128),
+           'tall': (255, 96, 96), 'second': (96, 255, 96), 'after': (96, 96, 255)}
 
 
 def check(name, ok, detail=''):
@@ -46,7 +51,7 @@ try:
     with open(os.path.join(work, 'page.html'), 'w', encoding='utf-8') as f:
         f.write(PAGE)
     shot = os.path.join(work, 'shot.bmp')
-    subprocess.run([EXE, 'file:///' + work.replace('\\', '/') + '/page.html', '--size', '800x600',
+    subprocess.run([EXE, 'file:///' + work.replace('\\', '/') + '/page.html', '--size', '800x900',
                     '--script', 'wait 600', '--screenshot', shot], timeout=120)
     im = Image.open(shot).convert('RGB')
     px = im.load()
@@ -82,6 +87,9 @@ try:
         m = box['centred']
         check('justify-content: center (a box as wide as its text, in the middle)',
               w('centred') < (right - left) / 4 and near((m[0] + m[2]) / 2, (left + right) / 2, 4), found)
+        t, s2, a = box['tall'], box['second'], box['after']
+        check('a float with clear goes below the float before it, what follows stays up beside that one',
+              s2[1] >= t[3] - 8 and a[1] < s2[1] and a[1] < t[3], found)
 finally:
     shutil.rmtree(work, ignore_errors=True)
 print('ALL OK' if not fails else '%d FAILED' % fails)

@@ -2492,7 +2492,7 @@ static int flow_box(Node *k, int x, int y, int w, const Style *st, int *from) {
     return bottom - y;
 }
 
-static void flow_float(Node *n, Ctx *c, const Style *st, int right) {
+static void flow_float(Node *n, Ctx *c, const Style *st, int right, int min_y) {
     if (c->line_items) flush_line(c);  // (a float in the middle of a line goes below it)
     int avail = c->w, em = st->size;
     const Lay *l = lay_items(n);
@@ -2506,7 +2506,7 @@ static void flow_float(Node *n, Ctx *c, const Style *st, int right) {
     if (maxw > 0 && w > maxw) w = maxw;
     if (w > avail) w = avail;
     if (w < 1) w = 1;
-    int gap = (int)(12 * S), y = c->y + c->margin, lft, rgt;
+    int gap = (int)(12 * S), y = MAX(c->y + c->margin, min_y), lft, rgt;
     for (int tries = 0; tries < 64; tries++) {  // as high as it fits beside earlier floats
         int next = float_band(c->bfc, y, 1, c->x, c->x + c->w, &lft, &rgt);
         if (next < 0 || rgt - lft >= w) break;
@@ -2814,11 +2814,16 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
         }
     }
     const Lay *lay = n->lay;
-    if (lay && lay->has[LP_CLEAR] && lay->val[LP_CLEAR] > 1) {
+    int floating = kind == BOX_FLOAT_LEFT || kind == BOX_FLOAT_RIGHT, clear_y = 0;
+    if (lay && lay->has[LP_CLEAR] && lay->val[LP_CLEAR] > 1 && floating && !c->measure && nfloats) {
+        // a float that clears goes below those floats itself; what follows it stays where it is
+        int v = lay->val[LP_CLEAR];
+        clear_y = floats_bottom(c->bfc, v == 2 ? 1 : v == 3 ? 2 : 3);
+    } else if (lay && lay->has[LP_CLEAR] && lay->val[LP_CLEAR] > 1) {
         begin_block(c);
         clear_floats(c, lay->val[LP_CLEAR] == 2 ? 1 : lay->val[LP_CLEAR] == 3 ? 2 : 3);
     }
-    if (kind == BOX_FLOAT_LEFT || kind == BOX_FLOAT_RIGHT) {
+    if (floating) {
         if (c->measure) {  // measured as a block of its own
             Node *nf = no_float;
             no_float = n;
@@ -2828,7 +2833,7 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
             no_float = nf;
             return;
         }
-        flow_float(n, c, &st, kind == BOX_FLOAT_RIGHT);
+        flow_float(n, c, &st, kind == BOX_FLOAT_RIGHT, clear_y);
         return;
     }
     if (kind == BOX_FLEX_ROW) { inline_style(n, &st, 0); flow_flex_row(n, c, &st); return; }
@@ -2927,6 +2932,10 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
             return;
         }
         if (tag == T_SUMMARY) st.flags |= LW_TEXT_BOLD;
+        if (tag >= T_H1 && tag <= T_H6) {  // a heading made inline still looks like one: its size is
+            st.size = (short)(st.size * heading_pct[tag - T_H1] / 100);  // then set on the box around it,
+            st.flags |= LW_TEXT_BOLD;  // with font-size, which we don't read (Wikipedia's .mw-heading)
+        }
         flow_children(n, c, &st);
         return;
     }
@@ -4398,6 +4407,132 @@ static int video_key(int key) {
     return 1;
 }
 
+// ---- the right-click menu ---------------------------------------------------------------
+// Its items are for what is under the mouse: a link, an image, a video, the selection. The
+// browser shows them above its own (Back, Forward, Reload) and says which one was picked.
+
+enum { MA_NONE, MA_OPEN_LINK, MA_COPY_LINK, MA_OPEN_IMAGE, MA_SAVE_IMAGE, MA_COPY_IMAGE, MA_PLAY, MA_MUTE, MA_COPY_VIDEO,
+       MA_COPY, MA_SELECT_ALL, MA_FULL_PAGE };
+#define MAX_MENU 24
+static u8 menu_acts[MAX_MENU];
+static int nmenu, menu_video = -1;
+static const char *menu_href, *menu_img;  // (strings of the document: they stay put while the menu is open)
+static int save_fetch = -1;               // the image being fetched to be saved
+static char save_name[128];
+static int save_name_len;
+
+static int image_item_at(int x, int y) {
+    int dy = y + scroll_y;
+    for (int i = draw_limit - 1; i >= 0; i--) {
+        Item *it = &items[i];
+        if (it->kind == IT_IMAGE && it->ref >= 0 && x >= it->x && x < it->x + it->w && dy >= it->y && dy < it->y + it->h) return i;
+    }
+    return -1;
+}
+
+static void menu_item(char *buf, int *k, int cap, const char *label, int act) {
+    int n = lw_strlen(label);
+    if (nmenu >= MAX_MENU || *k + n + 1 >= cap) return;
+    if (nmenu) buf[(*k)++] = '\n';
+    __builtin_memcpy(buf + *k, label, (u32)n);
+    *k += n;
+    menu_acts[nmenu++] = (u8)act;
+}
+
+static void open_menu(int x, int y) {
+    static char buf[512];
+    int k = 0;
+    nmenu = 0;
+    menu_href = menu_img = 0;
+    menu_video = video_full;
+    if (video_full < 0) {
+        int vi = item_at(x, y, IT_VIDEO);
+        if (vi >= 0) menu_video = items[vi].ref;
+        int li = item_at(x, y, IT_TEXT);  // (anything that is a link)
+        if (li >= 0 && items[li].link >= 0 && items[li].link < nlinks) menu_href = links[items[li].link].href;
+        int ii = image_item_at(x, y);
+        if (ii >= 0 && items[ii].ref < nimgs) menu_img = imgs[items[ii].ref].url;
+    }
+    if (menu_href) {
+        menu_item(buf, &k, (int)sizeof buf, "Open link in new &tab", MA_OPEN_LINK);
+        menu_item(buf, &k, (int)sizeof buf, "Copy &link address", MA_COPY_LINK);
+        menu_item(buf, &k, (int)sizeof buf, "-", MA_NONE);
+    }
+    if (menu_img) {
+        int data = iprefix(menu_img, lw_strlen(menu_img), "data:");  // (in the page itself: no address to give)
+        menu_item(buf, &k, (int)sizeof buf, data ? "~Open image in new tab" : "Open &image in new tab", MA_OPEN_IMAGE);
+        menu_item(buf, &k, (int)sizeof buf, data ? "~Save image as..." : "Sa&ve image as...", MA_SAVE_IMAGE);
+        menu_item(buf, &k, (int)sizeof buf, data ? "~Copy image address" : "C&opy image address", MA_COPY_IMAGE);
+        menu_item(buf, &k, (int)sizeof buf, "-", MA_NONE);
+    }
+    if (menu_video >= 0) {
+        Video *v = &videos[menu_video];
+        menu_item(buf, &k, (int)sizeof buf, v->state == LW_VIDEO_PLAYING ? "&Pause" : "&Play", MA_PLAY);
+        menu_item(buf, &k, (int)sizeof buf, v->muted ? "Un&mute" : "&Mute", MA_MUTE);
+        menu_item(buf, &k, (int)sizeof buf, video_src(v->node) ? "Copy vi&deo address" : "~Copy video address", MA_COPY_VIDEO);
+        menu_item(buf, &k, (int)sizeof buf, "-", MA_NONE);
+    }
+    menu_item(buf, &k, (int)sizeof buf, sel_a && sel_b && sel_a != sel_b ? "&Copy\tCtrl+C" : "~&Copy\tCtrl+C", MA_COPY);
+    menu_item(buf, &k, (int)sizeof buf, "Select &all\tCtrl+A", MA_SELECT_ALL);
+    if (main_node) menu_item(buf, &k, (int)sizeof buf, full_page ? "Show reader vie&w" : "Show full pa&ge", MA_FULL_PAGE);
+    lw_menu(buf, k);
+}
+
+// The file name an address ends with ("image" if none).
+static int url_file_name(const char *u, char *out, int cap) {
+    int n = 0, start = 0;
+    while (u[n] && u[n] != '?' && u[n] != '#') n++;
+    for (int i = 0; i < n; i++)
+        if (u[i] == '/') start = i + 1;
+    int k = 0;
+    for (int i = start; i < n && k < cap - 1; i++) out[k++] = u[i];
+    if (!k)
+        for (const char *d = "image"; *d && k < cap - 1; d++) out[k++] = *d;
+    return k;
+}
+
+LW_EXPORT(lw_on_menu) void lw_on_menu(int i) {
+    static char u[4096];
+    if (i < 0 || i >= nmenu) return;
+    switch (menu_acts[i]) {
+    case MA_OPEN_LINK:
+        if (!menu_href) break;
+        if (iprefix(menu_href, lw_strlen(menu_href), "mailto:") || iprefix(menu_href, lw_strlen(menu_href), "tel:")) follow(menu_href, 1);
+        else lw_open_tab(u, display_url(menu_href, u, (int)sizeof u), 1);
+        break;
+    case MA_COPY_LINK: if (menu_href) lw_clipboard_set(u, display_url(menu_href, u, (int)sizeof u)); break;
+    case MA_OPEN_IMAGE: if (menu_img) lw_open_tab(u, display_url(menu_img, u, (int)sizeof u), 1); break;
+    case MA_COPY_IMAGE: if (menu_img) lw_clipboard_set(u, display_url(menu_img, u, (int)sizeof u)); break;
+    case MA_SAVE_IMAGE:  // fetched again (from the cache, usually), then handed to the browser to save
+        if (!menu_img) break;
+        save_name_len = url_file_name(menu_img, save_name, (int)sizeof save_name);
+        save_fetch = lw_fetch(u, display_url(menu_img, u, (int)sizeof u));
+        break;
+    case MA_PLAY: if (menu_video >= 0 && menu_video < nvideos) video_toggle(menu_video); break;
+    case MA_MUTE:
+        if (menu_video >= 0 && menu_video < nvideos) {
+            Video *v = &videos[menu_video];
+            v->muted = !v->muted;
+            if (v->handle) lw_video_volume(v->handle, 1, v->muted);
+            dirty = 1;
+        }
+        break;
+    case MA_COPY_VIDEO:
+        if (menu_video >= 0 && menu_video < nvideos) {
+            const char *src = video_src(videos[menu_video].node);
+            if (src) lw_clipboard_set(u, display_url(src, u, (int)sizeof u));
+        }
+        break;
+    case MA_COPY: copy_selection(); break;
+    case MA_SELECT_ALL: select_all_text(); dirty = 1; break;
+    case MA_FULL_PAGE:
+        full_page = !full_page;
+        need_layout = 1;
+        scroll_y = target_y = 0;
+        break;
+    }
+}
+
 // Each frame: what the playing videos are doing. Their bars are drawn again when what they
 // show changes (the browser draws the pictures by itself).
 static void videos_tick(void) {
@@ -4458,6 +4593,10 @@ LW_EXPORT(lw_pointer) int lw_pointer(int kind, float fx, float fy, int button) {
     mouse_in = kind != LW_LEAVE;
     hover_scroll = scroll_y;
     int bar_x = W - (int)(12 * S);
+    if (button == 2 && (kind == LW_DOWN || kind == LW_UP)) {  // the right button: the menu
+        if (kind == LW_UP) open_menu(x, y);
+        return LW_CURSOR_ARROW;
+    }
     if (video_full >= 0) {
         if (kind != LW_WHEEL && kind != LW_LEAVE) video_pointer(kind, x, y, button);
         return LW_CURSOR_ARROW;
@@ -5091,6 +5230,13 @@ LW_EXPORT(lw_on_fetch_ex) void lw_on_fetch_ex(int id, int status, const u8 *data
         doc_begin(type, type_len, url, url_len);
         doc_data((u8 *)data, len);
         doc_end();
+        return;
+    }
+    if (id == save_fetch) {  // an image to save (the menu's Save image as...)
+        save_fetch = -1;
+        if (status == 200 && len > 0) lw_save_file(save_name, save_name_len, data, len);
+        else show_toast("The image could not be downloaded.");
+        mem_free((void *)data);
         return;
     }
     int slot = sheet_arrived(id, status, data, len);
