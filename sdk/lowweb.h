@@ -54,6 +54,9 @@
 //         asks before it unloads the page (back/forward, reload; for the viewer also a
 //         background tab put to sleep to save memory) and hands the number back right
 //         after lw_start when the same history entry is loaded again. 0 = nothing to restore.
+//   void  lw_on_menu(int item);
+//         optional: the user picked item number `item` (counting every line, "-" ones too)
+//         of the page's own items in the right-click menu (lw_menu).
 //   int   lw_find(const char *text, int len, int how);
 //         optional: find in page, for the browser's find bar (Ctrl+F). how: 0 = look for
 //         text (memory from lw_alloc, the page frees it; len 0 = nothing), starting from
@@ -192,6 +195,14 @@ LW_IMPORT(video_place) void lw_video_place(int video, int x, int y, int w, int h
 // user's click or key), 0 goes back, -1 just asks. Returns whether it is (or is about to be:
 // the page gets lw_resize after the call). The user can leave it any time (Esc, F11).
 LW_IMPORT(fullscreen) int lw_fullscreen(int on);
+
+// The right-click menu. While handling a right click (lw_pointer: up, button 2), a page
+// that exports lw_on_menu may give items of its own, one per line: "-" draws a line, a "~"
+// first shows the item greyed out, "&" marks the letter that picks it from the keyboard
+// ("&&" is an &), and a tab separates a shortcut shown on the right. The
+// browser shows them above its own (Back, Forward, Reload) once lw_pointer returns, and
+// calls lw_on_menu with the one picked, as the user's input (it may copy, open a tab, ...).
+LW_IMPORT(menu) void lw_menu(const char *items, int len);
 
 // ---- helpers ----------------------------------------------------------------
 

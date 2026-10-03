@@ -92,6 +92,7 @@ TESTS = [
     ('video', script('tests/check_video.py')),
     ('history', script('tests/check_history.py')),
     ('referer', script('tests/check_referer.py')),
+    ('menu', script('tests/check_menu.py')),
 ]
 
 only = sys.argv[1:]

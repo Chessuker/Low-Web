@@ -82,6 +82,7 @@ Keys:
 | Middle click / `Ctrl`+click on a link | Open the link in a background tab |
 | `F5` · `Ctrl+F5` · `Alt+←/→` · `Alt+Home` | Reload (asks the server whether it changed) · reload without the cache · back/forward · home |
 | `F11` · `Esc` | Fullscreen (no tab strip, no toolbar) · leave fullscreen |
+| Right-click · menu key / `Shift+F10` | A menu for what is under the mouse: a link (open in a new tab, copy its address), an image (open, save, copy its address), a video (play/pause, mute, copy its address), copy the selection, select all, reader view/full page; then back, forward, reload |
 | `Ctrl+F` · `Enter`/`F3` · `Shift+Enter`/`Shift+F3` · `Esc` | Find in page (a bar at the top right shows "current/total", case-insensitive) · next · previous · close |
 
 Drop a `.wasm` file on the window to run it · drop a picture on Paint to open it.
@@ -247,9 +248,10 @@ Every function is in [`sdk/lowweb.h`](sdk/lowweb.h). In short:
 | `lw_pointer` (the mouse → returns a cursor) | `lw_text`, `lw_text_width` (bold/italic/monospace), `lw_line_breaks` |
 | `lw_key`, `lw_char` | `lw_fetch` → the answer comes through `lw_on_fetch` / `lw_on_fetch_ex` |
 | `lw_alloc` (for the browser to get memory in the page) | `lw_open_file` → `lw_on_file`, `lw_save_file`, `lw_clipboard_set/get` |
-| `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (a streamed document), `lw_state`/`lw_restore` (where the reader is), `lw_find` (find in page) (the last three are optional) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
+| `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (a streamed document), `lw_state`/`lw_restore` (where the reader is), `lw_find` (find in page), `lw_on_menu` (an item of the page's own in the right-click menu was picked) (the last four are optional) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
 | | `lw_video_open/play/pause/seek/volume/info/error/close`: video and audio; the page says where each goes with `lw_video_place` at every `lw_present` and the browser draws the pictures there itself (not through the interpreter, frame by frame); sound can start only while the user clicks or presses a key (otherwise it plays muted) |
 | | `lw_fullscreen` (only while the user clicks or presses a key; the user can leave with Esc/F11) |
+| | `lw_menu` (while handling a right click: the page's own items for the menu the browser shows, above Back/Forward/Reload) |
 
 ## Hosting
 
@@ -277,7 +279,8 @@ show as annotations.
 | `python tests/check_referer.py` | The headers the browser sends (a test server on 2 ports = 2 origins): a Chrome-style User-Agent + `Low-web/0.1`; Referer as browsers send it by default (`strict-origin-when-cross-origin`): the whole address (no #fragment) to the same origin, only the origin to another one, none for a typed address |
 | `python tests/check_history.py` | Back/forward: a link the user clicks adds an entry, but a page that moves on by itself (a `<meta refresh>` like a search engine's redirect page) takes its own place, so Back goes back to the search instead of round to the same page |
 | `python tests/check_video.py` | Video (`tests/samples/colors.mp4`: one second each of red, green, blue and yellow, so a screenshot tells where it is): click to play, Space to pause, a click on the track at 85%, playing to the end, F for fullscreen / Esc, `<audio>`, a missing file says why on its picture, and over slow HTTP (`slow_server.py`) with the picture data 3 MB into the file, which needs a range request; SKIP where Windows has no Media Foundation, and the `<audio>` check is skipped on a computer with no sound device |
-| `python tests/check_css_layout.py` | CSS layout from stylesheets: a page of coloured boxes (a flex row 1:2 + a fixed width + gap, a right float with text around it + clear, a 3-column grid, a carousel in `overflow:hidden`, `justify-content:center`), each box found by its colour in a screenshot |
+| `python tests/check_css_layout.py` | CSS layout from stylesheets: a page of coloured boxes (a flex row 1:2 + a fixed width + gap, a right float with text around it + clear, a 3-column grid, a carousel in `overflow:hidden`, `justify-content:center`, a float with `clear` that goes below the float before it while the text after it stays up beside that one), each box found by its colour in a screenshot |
+| `python tests/check_menu.py` | The right-click menu: the items on a link, an image and plain text (Copy greyed out until something is selected), the browser's own after them, and what picking does (copy a link's whole address, save an image's file, copy the selection) |
 | `python tests/check_progressive.py` | Pages loading slowly (`slow_server.py` on a free port): a big table shows rows before the download ends, a page without `<main>` shows its first screen before the end, a `<main>` that comes late still ends in reader view, and the final picture is the same as when loaded at once |
 | `python tests/check_edit.py` | Text fields (typing, arrows, Home/End, Shift to select, Delete/Backspace, cutting, Thai vowels, double-click, drag to select, Tab, textarea), Thai `#fragment`s as characters and as `%`, find in page (count, next/previous, case, not found, text files) |
 | `python tests/check_select.py` | Selecting/copying/pasting text: the whole page, a drag (across a link), text fields (paste, cut, password fields can't be copied), text files, error pages; the tab strip: which parts are caption/buttons/resize edge, the maximize button |

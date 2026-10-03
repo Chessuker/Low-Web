@@ -417,6 +417,8 @@ struct Page {
     bool typed = false;   // the user typed into it (a form): don't put the tab to sleep
     int f_state = -1, f_restore = -1;  // optional: the page's reading position (lw_state / lw_restore)
     int f_find = -1;                   // optional: find in page (lw_find)
+    int f_on_menu = -1;                // optional: an item of its own in the right-click menu was picked
+    std::vector<std::string> menu;     // those items (lw_menu, while handling the right click)
     int f_start = -1, f_resize = -1, f_frame = -1, f_pointer = -1, f_key = -1, f_char = -1, f_alloc = -1,
         f_on_file = -1, f_on_fetch = -1, f_on_fetch_ex = -1,
         f_on_fetch_begin = -1, f_on_fetch_data = -1, f_on_fetch_end = -1;
@@ -841,6 +843,19 @@ std::vector<wasm::HostImport> make_imports(Page *page) {
         auto *r = nav(net::resolve(page->url, mem_str(in, a[0], a[1])));
         r->new_tab = a[2] ? 1 : 2;
         post_nav(r);
+    });
+    // lw_menu("item\nitem\n-\n..."): while handling a right click, the page's own items for the
+    // menu shown after it ("-" a line between them, "~" first: shown greyed out; "&" marks the key).
+    add("menu", "ii:", [page](Instance &in, uint64_t *a) {
+        std::string s = mem_str(in, a[0], a[1]);
+        if (!g_user_input) return;
+        page->menu.clear();
+        for (size_t i = 0; i <= s.size() && page->menu.size() < 32;) {
+            size_t j = s.find('\n', i);
+            if (j == std::string::npos) j = s.size();
+            if (j > i) page->menu.push_back(s.substr(i, std::min<size_t>(j - i, 200)));
+            i = j + 1;
+        }
     });
     add("open_file", "ii:", [page](Instance &in, uint64_t *a) {
         auto *r = new OpenRequest{page->tab ? page->tab->id : 0, page->gen, mem_str(in, a[0], a[1])};
@@ -1269,6 +1284,7 @@ void start_wasm_page(Tab &t, const std::vector<uint8_t> &module, const std::stri
     p.f_state = find_export(p, "lw_state", "");
     p.f_restore = find_export(p, "lw_restore", "i");
     p.f_find = find_export(p, "lw_find", "iii");
+    p.f_on_menu = find_export(p, "lw_on_menu", "i");
     p.viewer = doc != nullptr;
     if (p.f_on_fetch_begin < 0 || p.f_on_fetch_data < 0 || p.f_on_fetch_end < 0)
         p.f_on_fetch_begin = p.f_on_fetch_data = p.f_on_fetch_end = -1;  // all or nothing
@@ -1814,6 +1830,8 @@ bool browser_key(WPARAM vk, int mods) {
     return false;
 }
 
+void show_context_menu(int vx, int vy);
+
 LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static bool tracking = false;
     static int buttons_down = 0;
@@ -1883,9 +1901,25 @@ LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int b = msg == WM_LBUTTONUP ? 0 : msg == WM_MBUTTONUP ? 1 : 2;
         if (--buttons_down <= 0) { buttons_down = 0; ReleaseCapture(); }
         t.doc.selecting = false;
+        if (b == 2 && t.page) t.page->menu.clear();
         pointer_event(2, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), b);
+        if (b == 2) show_context_menu(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         return 0;
     }
+    case WM_CONTEXTMENU:  // the menu key, Shift+F10: the menu for where the mouse is
+        if (GET_X_LPARAM(lp) == -1 && GET_Y_LPARAM(lp) == -1) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            if (!PtInRect(&rc, pt)) pt = POINT{rc.right / 3, rc.bottom / 3};
+            if (t.page) t.page->menu.clear();
+            pointer_event(0, pt.x, pt.y, 2);
+            pointer_event(2, pt.x, pt.y, 2);
+            show_context_menu(pt.x, pt.y);
+        }
+        return 0;
     case WM_XBUTTONUP:
         go_history(GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? -1 : 1);
         return TRUE;
@@ -2491,6 +2525,90 @@ void set_fullscreen(bool on) {
     log_line(on ? "[low-web] fullscreen" : "[low-web] fullscreen off");
 }
 
+// ---- the right-click menu: the page's items (lw_menu), then the browser's --------------------
+
+enum { ID_CTX_PAGE = 1000, ID_CTX_BACK = 2000, ID_CTX_FORWARD, ID_CTX_RELOAD, ID_CTX_COPY, ID_CTX_SELECT_ALL };
+std::vector<std::pair<std::wstring, int>> g_script_menu;  // tests: the last menu, to pick from (menupick)
+struct ContextMenuOf { int tab_id = 0; uint64_t gen = 0; } g_menu_of;
+
+void context_menu_command(int cmd) {
+    Tab *t = tab_by_id(g_menu_of.tab_id);
+    if (!t) return;
+    if (cmd >= ID_CTX_PAGE && cmd < ID_CTX_BACK) {
+        if (t->page && t->page->gen == g_menu_of.gen && !t->page->crashed && t->page->f_on_menu >= 0) {
+            UserInput user(false);  // as the click it comes from: it may copy, open a tab, save
+            page_call(*t, t->page->f_on_menu, {(uint32_t)(cmd - ID_CTX_PAGE)});
+        }
+        return;
+    }
+    if (t != &T()) return;
+    Doc &doc = t->doc;
+    switch (cmd) {
+    case ID_CTX_BACK: go_history(-1); break;
+    case ID_CTX_FORWARD: go_history(1); break;
+    case ID_CTX_RELOAD: reload(); break;
+    case ID_CTX_COPY: {
+        int s0 = std::min(doc.sel_a, doc.sel_b), s1 = std::max(doc.sel_a, doc.sel_b);
+        if (s1 > s0 && s1 <= (int)doc.text.size()) clipboard_set(doc.text.substr(s0, s1 - s0));
+        break;
+    }
+    case ID_CTX_SELECT_ALL:
+        doc.sel_a = 0;
+        doc.sel_b = (int)doc.text.size();
+        InvalidateRect(g_view, nullptr, FALSE);
+        break;
+    }
+}
+
+void show_context_menu(int vx, int vy) {
+    Tab &t = T();
+    std::vector<std::string> items;
+    if (t.page) items.swap(t.page->menu);
+    g_menu_of = ContextMenuOf{t.id, t.page ? t.page->gen : 0};
+    HMENU m = CreatePopupMenu();
+    g_script_menu.clear();
+    auto add = [&](const std::wstring &label, int id, bool on) {
+        if (label.empty()) { AppendMenuW(m, MF_SEPARATOR, 0, nullptr); g_script_menu.push_back({L"-", 0}); return; }
+        AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), id, label.c_str());
+        std::wstring plain;  // (for tests: without the shortcut, and the & that marks the item's key)
+        for (size_t i = 0; i < label.size() && label[i] != L'\t'; i++)
+            if (label[i] != L'&' || (i + 1 < label.size() && label[i + 1] == L'&' && ++i)) plain += label[i];
+        g_script_menu.push_back({on ? plain : L"~" + plain, on ? id : 0});
+    };
+    if (t.page && !t.page->crashed && t.page->f_on_menu >= 0) {
+        for (int i = 0; i < (int)items.size(); i++) {
+            const std::string &s = items[i];
+            if (s == "-") { add(L"", 0, false); continue; }
+            bool on = s[0] != '~';
+            std::wstring label;
+            for (wchar_t c : widen(on ? s : s.substr(1)))
+                if (c >= 32 || c == L'\t') label += c;
+            add(label, ID_CTX_PAGE + i, on);
+        }
+        if (!g_script_menu.empty() && g_script_menu.back().first != L"-") add(L"", 0, false);
+    }
+    if (showing_doc(t)) {
+        add(L"&Copy\tCtrl+C", ID_CTX_COPY, t.doc.sel_a != t.doc.sel_b);
+        add(L"Select &all\tCtrl+A", ID_CTX_SELECT_ALL, !t.doc.text.empty());
+        add(L"", 0, false);
+    }
+    add(L"&Back\tAlt+Left", ID_CTX_BACK, t.hist_idx > 0);
+    add(L"&Forward\tAlt+Right", ID_CTX_FORWARD, t.hist_idx + 1 < (int)t.history.size());
+    add(L"&Reload\tCtrl+R", ID_CTX_RELOAD, t.hist_idx >= 0);
+    if (g_script_mode) {  // tests: say what it would show; "menupick LABEL" picks from it
+        std::wstring line = L"[menu]";
+        for (auto &[label, id] : g_script_menu) line += L" | " + label;
+        log_line(narrow(line));
+        DestroyMenu(m);
+        return;
+    }
+    POINT pt{vx, vy};
+    ClientToScreen(g_view, &pt);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, g_main, nullptr);
+    DestroyMenu(m);
+    if (cmd) context_menu_command(cmd);
+}
+
 void show_engine_menu() {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Search with:");
@@ -2793,6 +2911,15 @@ void script_step() {
         log_line("[hittest] " + std::to_string(a) + " " + std::to_string(b) + " -> " +
                  std::to_string(SendMessageW(g_main, WM_NCHITTEST, 0, MAKELPARAM(pt.x, pt.y))) +
                  (IsZoomed(g_main) ? " (maximized)" : ""));
+    }
+    else if (o == "menupick") {  // menupick LABEL: picks that item of the last right-click menu ([menu] in the log)
+        std::wstring want = widen(cmd.size() > cmd.find("menupick") + 9 ? cmd.substr(cmd.find("menupick") + 9) : "");
+        int id = 0;
+        for (auto &[label, i] : g_script_menu) {
+            if (i && label == want) id = i;
+        }
+        if (id) context_menu_command(id);
+        else log_line("[script] no such menu item: " + narrow(want));
     }
     else if (o == "clip") g_script_clipboard = widen(cmd.size() > cmd.find("clip") + 5 ? cmd.substr(cmd.find("clip") + 5) : "");
     else log_line("[script] unknown command: " + cmd);
