@@ -522,9 +522,11 @@ struct Node {
     u8 css_ep;          // css.c epoch css_hidden was computed in
     u8 lpass;           // layout pass that last reached this node (y is valid for that pass)
     u8 open;            // element: the parser may still add children (the document is streaming in)
+    u8 box_ep;          // css.c epoch box was looked up in
     int ref;            // image or control index, -1
     int y;              // layout: top of the element (for #fragment links)
     struct Lay *lay;    // element: its CSS layout properties (css.c), 0 if none; valid with css_ep
+    struct Lay *box;    // element: its margin, padding, background (css.c box_css), 0 if none; valid with box_ep
 };
 
 static Node *root, *head_node;
@@ -2072,7 +2074,8 @@ typedef struct {
     Ctx sub;
     Style st;
     u32 bg;
-    int mb, ml, mr, pad, bg_item, post;
+    int mb, ml, mr, bg_item, post;
+    int pt, pr, pb, pl;    // padding (inside the background, if it has one)
 } Frame;
 #define MAX_FRAMES 96
 static Frame frames[MAX_FRAMES];
@@ -2084,14 +2087,14 @@ enum { POST_NONE, POST_LIST, POST_LI };  // what a block does when it ends
 static void close_block(Frame *f) {
     Ctx *c = f->c, *sub = &f->sub;
     flush_line(sub);
-    if (f->bg >> 24) {
-        sub->y += sub->margin + f->pad;
+    if ((f->bg >> 24) || f->pb > 0) {
+        sub->y += sub->margin + f->pb;
         sub->margin = 0;
         if (f->bg_item >= 0) items[f->bg_item].h = sub->y - items[f->bg_item].y;
     }
     c->y = sub->y;
     c->margin = MAX(sub->margin, f->mb);
-    int extra = f->ml + f->mr + ((f->bg >> 24) ? 2 * f->pad : 0);
+    int extra = f->ml + f->mr + f->pl + f->pr;
     c->max_w = MAX(c->max_w, sub->max_w + extra);
     c->min_w = MAX(c->min_w, sub->min_w + extra);
     c->line_start = nitems;
@@ -2100,7 +2103,10 @@ static void close_block(Frame *f) {
     else if (f->post == POST_LI) marker_pending = 0;
 }
 
-// Lays out n's children as a block. Margins in device px.
+static int box_pad[4], box_pad_set;  // padding (top, right, bottom, left) for the next block(), from CSS
+
+// Lays out n's children as a block. Margins in device px; pad: padding on every side, used
+// with a background (unless box_pad_set: then box_pad, with or without one).
 static void block(Node *n, Ctx *c, const Style *st, int mt, int mb, int ml, int mr, u32 bg, int pad, int post) {
     int defer = defer_block && nframes < MAX_FRAMES;
     defer_block = 0;
@@ -2108,7 +2114,10 @@ static void block(Node *n, Ctx *c, const Style *st, int mt, int mb, int ml, int 
     Frame *f = defer ? &frames[nframes++] : &local;
     __builtin_memset(f, 0, sizeof *f);
     f->n = n; f->c = c; f->st = *st; f->bg = bg;
-    f->mb = mb; f->ml = ml; f->mr = mr; f->pad = pad; f->post = post;
+    f->mb = mb; f->ml = ml; f->mr = mr; f->post = post;
+    if (box_pad_set) { f->pt = box_pad[0]; f->pr = box_pad[1]; f->pb = box_pad[2]; f->pl = box_pad[3]; }
+    else if (bg >> 24) f->pt = f->pr = f->pb = f->pl = pad;
+    box_pad_set = 0;
     f->bg_item = -1;
     begin_block(c);
     c->margin = MAX(c->margin, mt);
@@ -2131,10 +2140,13 @@ static void block(Node *n, Ctx *c, const Style *st, int mt, int mb, int ml, int 
             f->bg_item = nitems - 1;
             sub->line_start = nitems;
         }
-        sub->y += pad;
-        sub->x += pad;
-        sub->w = MAX(sub->w - 2 * pad, (int)(8 * S));
+    } else if (f->pt > 0) {  // (padding keeps the margins of what is inside from collapsing with the block's)
+        sub->y += sub->margin;
+        sub->margin = 0;
     }
+    sub->y += f->pt;
+    sub->x += f->pl;
+    sub->w = MAX(sub->w - f->pl - f->pr, (int)(8 * S));
     n->y = sub->y + sub->margin;
     if (defer) return;  // layout_step lays out the children
     flow_children(n, sub, st);
@@ -2146,17 +2158,21 @@ static void block(Node *n, Ctx *c, const Style *st, int mt, int mb, int ml, int 
 #define MAX_COLS 64
 typedef struct { Node *cell; int col, span; } Cell;
 
+// (rows and cells a stylesheet hides are left out: sites keep a narrow-screen version of a
+// column next to the wide one, e.g. GitHub's file list)
 static int table_rows(Node *t, Node **rows, int max) {
     int n = 0;
     for (Node *c = t->first; c && n < max; c = c->next) {
-        if (c->type != N_ELEM) continue;
+        if (c->type != N_ELEM || is_hidden(c)) continue;
         if (c->tag == T_TR) rows[n++] = c;
         else if (c->tag == T_THEAD || c->tag == T_TBODY || c->tag == T_TFOOT || c->tag == T_FORM)
             for (Node *r = c->first; r && n < max; r = r->next)
-                if (r->type == N_ELEM && r->tag == T_TR) rows[n++] = r;
+                if (r->type == N_ELEM && r->tag == T_TR && !is_hidden(r)) rows[n++] = r;
     }
     return n;
 }
+
+static int is_cell(Node *n) { return n->type == N_ELEM && (n->tag == T_TD || n->tag == T_TH) && !is_hidden(n); }
 
 static int span_of(Node *cell) {
     int s = parse_int(attr(cell, "colspan"), 0);
@@ -2188,16 +2204,30 @@ static void measure_cell(Node *cell, Node *row, const Style *st, int *mn, int *m
 
 static void flow_table_at(Node *t, Ctx *c, const Style *st);
 
-// A table beside floats takes the room left there if that is at least half the width,
-// else it goes below them.
-static void flow_table(Node *t, Ctx *c, const Style *st) {
+// A box laid out as a whole (a table, a flex row, a grid) beside floats takes the room left
+// there if that is at least half the width, else it goes below them (it never runs under
+// them). The caller puts c->x and c->w back afterwards.
+static void beside_floats(Ctx *c) {
     begin_block(c);
-    if (c->measure || !nfloats) { flow_table_at(t, c, st); return; }
-    int l, r, x = c->x, w = c->w;
-    if (float_band(c->bfc, c->y + c->margin, (int)(20 * S), c->x, c->x + c->w, &l, &r) >= 0) {
+    if (c->measure || !nfloats) return;
+    for (int tries = 0; tries < 8; tries++) {
+        int l, r, y = c->y + c->margin;
+        int next = float_band(c->bfc, y, (int)(20 * S), c->x, c->x + c->w, &l, &r);
+        if (next < 0) return;
+        if (next - y <= (int)(48 * S)) {  // a float that ends just below (a "more" link): below it
+            c->y = next;
+            c->margin = 0;
+            continue;
+        }
         if (r - l >= c->w / 2) { c->x = l; c->w = r - l; }
         else clear_floats(c, 3);
+        return;
     }
+}
+
+static void flow_table(Node *t, Ctx *c, const Style *st) {
+    int x = c->x, w = c->w;
+    beside_floats(c);
     flow_table_at(t, c, st);
     c->x = x;
     c->w = w;
@@ -2224,7 +2254,7 @@ static void flow_table_at(Node *t, Ctx *c, const Style *st) {
     for (int r = 0; r < nrows; r++) {
         int k = 0;
         for (Node *cell = rows[r]->first; cell; cell = cell->next)
-            if (cell->type == N_ELEM && (cell->tag == T_TD || cell->tag == T_TH)) k += span_of(cell);
+            if (is_cell(cell)) k += span_of(cell);
         ncols = MAX(ncols, MIN(k, MAX_COLS));
     }
 
@@ -2251,7 +2281,7 @@ static void flow_table_at(Node *t, Ctx *c, const Style *st) {
     for (int r = 0; r < nrows; r++) {
         int col = 0;
         for (Node *cell = rows[r]->first; cell && col < ncols; cell = cell->next) {
-            if (cell->type != N_ELEM || (cell->tag != T_TD && cell->tag != T_TH)) continue;
+            if (!is_cell(cell)) continue;
             int span = MIN(span_of(cell), ncols - col);
             int mn, mx;
             measure_cell(cell, rows[r], st, &mn, &mx);
@@ -2337,7 +2367,7 @@ static void flow_table_at(Node *t, Ctx *c, const Style *st) {
         int first_item = nitems;
         int cell_items[MAX_COLS], cell_count = 0;
         for (Node *cell = row->first; cell && col < ncols; cell = cell->next) {
-            if (cell->type != N_ELEM || (cell->tag != T_TD && cell->tag != T_TH)) continue;
+            if (!is_cell(cell)) continue;
             int span = MIN(span_of(cell), ncols - col);
             int cw = spacing * (span - 1);
             for (int k = 0; k < span; k++) cw += col_w[col + k];
@@ -2464,7 +2494,10 @@ static void measure_node(Node *k, const Style *st, int *mn, int *mx) {
     __builtin_memset(&m, 0, sizeof m);
     m.w = 1 << 24;
     m.measure = 1;
+    Node *nf = no_float;
+    no_float = k;  // (measured as flow_box lays it out: a box of its own)
     flow(k, &m, st);
+    no_float = nf;
     flush_line(&m);
     *mn = m.min_w;
     *mx = m.max_w;
@@ -2493,7 +2526,6 @@ static int flow_box(Node *k, int x, int y, int w, const Style *st, int *from) {
 }
 
 static void flow_float(Node *n, Ctx *c, const Style *st, int right, int min_y) {
-    if (c->line_items) flush_line(c);  // (a float in the middle of a line goes below it)
     int avail = c->w, em = st->size;
     const Lay *l = lay_items(n);
     int w = len_px(l, LP_WIDTH, em, avail, -1);
@@ -2507,7 +2539,17 @@ static void flow_float(Node *n, Ctx *c, const Style *st, int right, int min_y) {
     if (w > avail) w = avail;
     if (w < 1) w = 1;
     int gap = (int)(12 * S), y = MAX(c->y + c->margin, min_y), lft, rgt;
-    for (int tries = 0; tries < 64; tries++) {  // as high as it fits beside earlier floats
+    // In the middle of a line: a right float that fits beside what the line has so far goes
+    // on that line (a heading with a "more" link at its right); anything else goes below it.
+    int beside = c->line_items && right && !min_y && c->lx + gap + w <= c->w;
+    if (c->line_items && !beside) {
+        flush_line(c);
+        y = MAX(c->y + c->margin, min_y);
+    }
+    if (beside) {
+        lft = c->x;
+        rgt = c->x + c->w;
+    } else for (int tries = 0; tries < 64; tries++) {  // as high as it fits beside earlier floats
         int next = float_band(c->bfc, y, 1, c->x, c->x + c->w, &lft, &rgt);
         if (next < 0 || rgt - lft >= w) break;
         y = next;
@@ -2524,6 +2566,26 @@ static void flow_float(Node *n, Ctx *c, const Style *st, int right, int min_y) {
     f->bfc = c->bfc;
     f->right = (u8)right;
     n->y = y;
+    if (beside) {
+        // the float's items go before the line's (they are not part of it), and the rest of
+        // the line keeps out of its way
+        int line = from - c->line_start, fl = nitems - from;
+        if (line > 0 && fl > 0) {
+            Item *tmp = (Item *)must_alloc((u32)line * sizeof(Item));
+            __builtin_memcpy(tmp, &items[c->line_start], (u32)line * sizeof(Item));
+            __builtin_memmove(&items[c->line_start], &items[from], (u32)fl * sizeof(Item));
+            __builtin_memcpy(&items[c->line_start + fl], tmp, (u32)line * sizeof(Item));
+            mem_free(tmp);
+        }
+        c->line_start += fl;
+        if (!c->adj) {
+            c->bx = c->x;
+            c->bw = c->w;
+            c->adj = 1;
+        }
+        c->w = MAX(c->w - w - gap, 1);
+        return;
+    }
     c->line_start = nitems;  // the float's items are not part of the line that comes next
 }
 
@@ -2563,6 +2625,11 @@ static int clips_x(Node *n) {
     return 0;
 }
 
+static int flex_order(Node *k) {
+    const Lay *l = lay_items(k);
+    return l && l->has[LP_ORDER] ? l->val[LP_ORDER] : 0;
+}
+
 // display: flex, in a row (flex-direction: row; columns are laid out as blocks).
 static void flow_flex_row(Node *n, Ctx *c, const Style *st) {
     begin_block(c);
@@ -2572,6 +2639,12 @@ static void flow_flex_row(Node *n, Ctx *c, const Style *st) {
     Node **kids = (Node **)must_alloc(MAX_BOXES * sizeof(Node *));
     int nk = box_children(n, buf, MAX_BOXES);
     __builtin_memcpy(kids, buf, (u32)nk * sizeof(Node *));
+    for (int i = 1; i < nk; i++) {  // `order` (a stable insertion sort: few items, mostly in order already)
+        Node *k = kids[i];
+        int o = flex_order(k), j = i;
+        while (j > 0 && flex_order(kids[j - 1]) > o) { kids[j] = kids[j - 1]; j--; }
+        kids[j] = k;
+    }
     int gap = len_px(l, LP_CGAP, em, W, 0), rgap = len_px(l, LP_RGAP, em, W, 0);
     int wrap = l && l->has[LP_WRAP] && l->val[LP_WRAP] == 2;
     int justify = l && l->has[LP_JUSTIFY] ? l->val[LP_JUSTIFY] : 1, align = l && l->has[LP_ALIGN] ? l->val[LP_ALIGN] : 1;
@@ -2612,11 +2685,12 @@ static void flow_flex_row(Node *n, Ctx *c, const Style *st) {
     n->y = c->y;
     int y = c->y, i = 0;
     while (i < nk) {
-        int j = i, sum = 0;  // one line: i..j
+        int j = i, sum = 0, hyp = 0;  // one line: i..j
         while (j < nk) {
-            int add = basis[j] + (j > i ? gap : 0);
-            if (wrap && j > i && sum + add > W) break;
-            sum += add;
+            int add = MIN(MAX(basis[j], mins[j]), W) + (j > i ? gap : 0);  // (it needs at least its content's room)
+            if (wrap && j > i && hyp + add > W) break;
+            hyp += add;
+            sum += basis[j] + (j > i ? gap : 0);
             j++;
         }
         int free = W - sum, tgrow = 0;
@@ -2626,11 +2700,21 @@ static void flow_flex_row(Node *n, Ctx *c, const Style *st) {
             int w = basis[k];
             if (free > 0 && tgrow > 0) w += (int)((long long)free * grow[k] / tgrow);
             else if (free < 0 && tshrink > 0 && !clip) w -= (int)((long long)(-free) * shrink[k] * basis[k] / tshrink);
-            width[k] = MAX(w, mins[k]);
-            if (clip && width[k] > W) width[k] = W;
+            width[k] = MIN(MAX(w, mins[k]), W);  // never wider than the row: what is too wide wraps inside
         }
         int used = gap * (j - i - 1), extra = 0;
         for (int k = i; k < j; k++) used += width[k];
+        if (used > W && !clip) {  // items that grew past their share as the room their content needs: the others give way
+            long long slack = 0;
+            for (int k = i; k < j; k++) slack += width[k] - mins[k];
+            int over = used - W;
+            for (int k = i; k < j && slack > 0; k++) {
+                int give = (int)((long long)over * (width[k] - mins[k]) / slack);
+                width[k] -= MIN(give, width[k] - mins[k]);
+            }
+            used = gap * (j - i - 1);
+            for (int k = i; k < j; k++) used += width[k];
+        }
         int left = W - used, x = c->x, between = gap;
         if (left > 0 && !(free > 0 && tgrow > 0)) {
             int cnt = j - i;
@@ -2648,7 +2732,10 @@ static void flow_flex_row(Node *n, Ctx *c, const Style *st) {
             line_h = MAX(line_h, hs[k - i]);
             x += width[k] + between;
         }
-        for (int k = i; k < j; k++) stretch_and_align(from[k - i], to[k - i], y, line_h, hs[k - i], align);
+        for (int k = i; k < j; k++) {
+            const Lay *kl = lay_items(kids[k]);
+            stretch_and_align(from[k - i], to[k - i], y, line_h, hs[k - i], kl && kl->has[LP_ASELF] ? kl->val[LP_ASELF] : align);
+        }
         y += line_h + (j < nk ? rgap : 0);
         i = clip ? nk : j;
     }
@@ -2784,6 +2871,65 @@ static void flow_grid(Node *n, Ctx *c, const Style *st) {
     mem_free(kids);
 }
 
+// A block's margin, padding, background and width from the page's CSS, taken as advice:
+// - spacing stays within reason: text blocks (p, headings, lists...) keep at least their
+//   usual space above and below, nothing gets more than 3em of it, and no side more than a
+//   quarter of the width; negative margins count as 0 (they make things overlap);
+// - a background only where the text stays readable on it (contrast at least 3:1);
+// - a width or max-width only makes a block narrower, never narrower than 200 px, and
+//   auto margins centre it (a column of comfortable width).
+// *ml/*mr come in as the tag's margins, pad[4] as its padding; *pl_default: the part of *ml
+// that is really padding (the indent of a list).
+static int contrast_ok(u32 fg, u32 bg) {
+    float l[2];
+    u32 cs[2] = {fg, bg};
+    for (int i = 0; i < 2; i++) {
+        float r = (float)((cs[i] >> 16) & 255) / 255, g = (float)((cs[i] >> 8) & 255) / 255, b = (float)(cs[i] & 255) / 255;
+        r = r * r; g = g * g; b = b * b;  // (about the sRGB curve)
+        l[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    }
+    float hi = MAX(l[0], l[1]) + 0.05f, lo = MIN(l[0], l[1]) + 0.05f;
+    return hi >= 3 * lo;
+}
+
+static void box_from_css(Node *n, const Ctx *c, const Style *st, int *mt, int *mb, int *ml, int *mr, u32 *bg, int pad[4], int list) {
+    const Lay *b = box_css(n);
+    if (!b) return;
+    int em = st->size, w = c->measure ? -1 : c->w, cap_v = 3 * em, cap_h = c->measure ? (int)(200 * S) : c->w / 4;  // (measuring: % is 0)
+    int text_block = *mt > 0 || *mb > 0;
+    int side_m[4] = {*mt, *mr, *mb, *ml};
+    if (list) side_m[3] = 0;  // (a list's indent is padding: CSS that sets padding-left replaces it)
+    int autos = 0;
+    for (int i = 0; i < 4; i++) {
+        if (b->has[LP_MT + i]) {
+            if (b->unit[LP_MT + i] == U_AUTO) { if (i & 1) autos |= i == 1 ? 2 : 1; side_m[i] = 0; }
+            else {
+                int v = MAX(len_px(b, LP_MT + i, em, w, 0), 0);
+                v = MIN(v, (i & 1) ? cap_h : cap_v);
+                side_m[i] = (i & 1) || !text_block ? v : MAX(v, side_m[i]);
+            }
+        }
+        if (b->has[LP_PT + i]) pad[i] = MIN(MAX(len_px(b, LP_PT + i, em, w, 0), 0), (i & 1) ? cap_h : cap_v);
+    }
+    if (list && !b->has[LP_PL]) pad[3] = *ml;
+    *mt = side_m[0]; *mr = side_m[1]; *mb = side_m[2]; *ml = side_m[3];
+    if (b->has[LP_BG]) {
+        u32 col = (u32)b->val[LP_BG];
+        if (!(col >> 24)) *bg = 0;
+        else if (contrast_ok(st->color, col)) *bg = col;
+    }
+    if (c->measure) return;
+    int avail = c->w - *ml - *mr, want = len_px(b, LP_WIDTH, em, avail, -1), maxw = len_px(b, LP_MAXW, em, avail, -1);
+    if (want <= 0 || want > avail) want = avail;
+    if (maxw > 0 && maxw < want) want = maxw;
+    if (want < avail && want >= MIN(avail, (int)(200 * S))) {
+        int spare = avail - want;
+        if (autos == 3) { *ml += spare / 2; *mr += spare - spare / 2; }
+        else if (autos == 1) *ml += spare;
+        else *mr += spare;
+    }
+}
+
 static void flow(Node *n, Ctx *c, const Style *parent) {
     int defer = defer_block;  // only a block that is n itself may be deferred, not its descendants
     defer_block = 0;
@@ -2836,8 +2982,21 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
         flow_float(n, c, &st, kind == BOX_FLOAT_RIGHT, clear_y);
         return;
     }
-    if (kind == BOX_FLEX_ROW) { inline_style(n, &st, 0); flow_flex_row(n, c, &st); return; }
-    if (kind == BOX_GRID) { inline_style(n, &st, 0); flow_grid(n, c, &st); return; }
+    if (kind == BOX_FLEX_ROW || kind == BOX_GRID) {
+        int x = c->x, w = c->w;
+        if (tag == T_PRE || tag == T_LISTING || tag == T_XMP || tag == T_PLAINTEXT) {  // (MDN's code: a <pre> made a flex row)
+            st.pre = 1;
+            st.flags |= LW_TEXT_MONO;
+            st.size = (short)(st.size * 88 / 100);
+        }
+        inline_style(n, &st, 0);
+        beside_floats(c);
+        if (kind == BOX_FLEX_ROW) flow_flex_row(n, c, &st);
+        else flow_grid(n, c, &st);
+        c->x = x;
+        c->w = w;
+        return;
+    }
 
     switch (tag) {
     case T_A: {
@@ -2921,6 +3080,7 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
     int block_like = (tag_flags[tag] & FB) != 0;
     if (lay && (lay->disp == LD_INLINE || lay->disp == LD_INLINE_BLOCK) && tag != T_TD && tag != T_TH && tag != T_TR) block_like = 0;
     else if (lay && (lay->disp == LD_BLOCK || lay->disp == LD_FLEX || lay->disp == LD_GRID)) block_like = 1;
+    if (n == no_float) block_like = 1;  // a float, a flex or grid item is a box of its own, whatever its tag
     if (lay && lay->disp == LD_FLEX && block_like && (lay = lay_items(n))->has[LP_ALIGN] && lay->val[LP_ALIGN] == 3) st.align = 1;  // a centred column
     if (!block_like) {  // inline element
         inline_style(n, &st, 0);
@@ -2993,6 +3153,11 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
         }
         list_depth++;
         inline_style(n, &st, &bg);
+        box_pad[0] = box_pad[1] = box_pad[2] = 0;
+        box_pad[3] = ml;
+        ml = 0;
+        box_from_css(n, c, &st, &mt, &mb, &ml, &mr, &bg, box_pad, 0);
+        box_pad_set = 1;
         defer_block = defer;
         block(n, c, &st, mt, mb, ml, mr, bg, pad, POST_LIST);  // ends with list_depth--
         return;
@@ -3006,8 +3171,15 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
             if (!c->measure) set_marker(c->x - (int)(6 * S), &st);
         }
         inline_style(n, &st, &bg);
+        int z = 0;
+        if (box_css(n)) {
+            box_pad[0] = box_pad[1] = box_pad[2] = box_pad[3] = (bg >> 24) ? pad : 0;
+            box_from_css(n, c, &st, &mt, &mb, &ml, &mr, &bg, box_pad, 0);
+            box_pad_set = 1;
+            z = 1;
+        }
         defer_block = defer;
-        block(n, c, &st, 0, 0, 0, 0, bg, pad, POST_LI);  // ends with marker_pending = 0
+        block(n, c, &st, z ? mt : 0, z ? mb : 0, z ? ml : 0, z ? mr : 0, bg, pad, POST_LI);  // ends with marker_pending = 0
         return;
     }
     case T_DETAILS: mt = mb = (int)(4 * S); break;
@@ -3015,6 +3187,11 @@ static void flow(Node *n, Ctx *c, const Style *parent) {
     inline_style(n, &st, &bg);
     u32 col;
     if (tag == T_TD || tag == T_TH || tag == T_TR) { if (attr_color(n, "bgcolor", &col)) bg = col; }
+    if (tag != T_TD && tag != T_TH && tag != T_TR && box_css(n)) {  // (table cells are placed by the table)
+        box_pad[0] = box_pad[1] = box_pad[2] = box_pad[3] = (bg >> 24) ? pad : 0;
+        box_from_css(n, c, &st, &mt, &mb, &ml, &mr, &bg, box_pad, 0);
+        box_pad_set = 1;
+    }
     defer_block = defer;
     block(n, c, &st, mt, mb, ml, mr, bg, pad, POST_NONE);
 }

@@ -1,6 +1,7 @@
 // css.c — the part of CSS the viewer uses: which elements are hidden, and the properties
 // that place boxes (display: flex/grid/block/inline, float, clear, widths, flex and grid
-// settings, gaps). Included by viewer.c (not compiled on its own).
+// settings, gaps), and the box's own spacing and colour (margin, padding, background).
+// Included by viewer.c (not compiled on its own).
 //
 // Modern pages hide menus, dialogs and dropdowns with stylesheets; without this the reader
 // view would show all of them. We parse <style> and <link rel=stylesheet>, evaluate @media
@@ -30,14 +31,21 @@ struct Compound {
 
 // Layout properties. Each has a value (lval: x100 for lengths and numbers) and a unit.
 enum { LP_FLOAT, LP_CLEAR, LP_WIDTH, LP_MAXW, LP_DIR, LP_WRAP, LP_JUSTIFY, LP_ALIGN, LP_RGAP, LP_CGAP,
-       LP_GROW, LP_SHRINK, LP_BASIS, LP_COLS, LP_SPAN, LP_MINW, LP_OVER, LP_COUNT };  // LP_OVER: overflow-x, 1 visible, 2 clipped
+       LP_GROW, LP_SHRINK, LP_BASIS, LP_COLS, LP_SPAN, LP_MINW, LP_OVER,  // LP_OVER: overflow-x, 1 visible, 2 clipped
+       LP_ORDER, LP_ASELF,                                                 // flex items: order, align-self (as LP_ALIGN)
+       LP_MT, LP_MR, LP_MB, LP_ML, LP_PT, LP_PR, LP_PB, LP_PL,             // margin, padding (U_AUTO: margin auto)
+       LP_BG,                                                              // background colour (0xAARRGGBB; 0 = none)
+       LP_COUNT };
 enum { U_PX = 1, U_EM, U_REM, U_PCT, U_AUTO, U_NUM, U_STR, U_VW };  // U_STR: lval is a string (grid-template-columns)
 enum { LD_BLOCK = 1, LD_INLINE, LD_INLINE_BLOCK, LD_FLEX, LD_GRID, LD_OTHER };  // display, besides none
 // Properties that matter only for a float, a flex or grid container, or an item in one: looked
 // up when one asks (lay_items), not for every element (matching all the rules that set
 // widths, gaps and the like for every element costs ~15% of the layout of a big page).
-// Every element needs only display, float and clear.
-#define LP_ITEM_MASK (((1u << LP_COUNT) - 1) & ~((1u << LP_FLOAT) | (1u << LP_CLEAR)))
+// Every element needs only display, float and clear. The box's own spacing and colour
+// (LP_BOX_MASK) are a third set, looked up for the blocks layout reaches (box_css).
+#define LP_BOX_MASK ((((1u << (LP_BG + 1)) - 1) & ~((1u << LP_MT) - 1)))
+#define LP_ITEM_MASK (((1u << LP_COUNT) - 1) & ~((1u << LP_FLOAT) | (1u << LP_CLEAR)) & ~LP_BOX_MASK)
+#define LP_BOXPASS_MASK (LP_BOX_MASK | (1u << LP_WIDTH) | (1u << LP_MAXW))  // (a block's width too)
 
 // What a rule's declarations say. 0 = not set.
 typedef struct {
@@ -211,7 +219,10 @@ static int parse_compound(Cur *c, Compound *k) {
             }
             if (element || !pc) { k->impossible = 1; continue; }
             if (ieq(pc, "not") && args) k->nnots = parse_compound_list(args, args_end, &k->nots);
-            else if ((ieq(pc, "is") || ieq(pc, "where") || ieq(pc, "matches")) && args) k->nises = parse_compound_list(args, args_end, &k->ises);
+            else if ((ieq(pc, "is") || ieq(pc, "where") || ieq(pc, "matches")) && args) {
+                k->nises = parse_compound_list(args, args_end, &k->ises);
+                if (!k->nises) k->impossible = 1;  // :is() with nothing in it matches nothing (not everything)
+            }
             else if (ieq(pc, "first-child")) k->first_child = 1;
             else if (ieq(pc, "last-child")) k->last_child = 1;
             else if (ieq(pc, "only-child")) k->first_child = k->last_child = 1;
@@ -346,6 +357,84 @@ static void add_selector(const char *s, const char *e, const Decl *d, int order)
 
 // ---- @media ------------------------------------------------------------------------------
 
+// Media queries in the range syntax: (width >= 600px), (width<=calc(48rem - .02px)),
+// (400px <= width < 900px).
+
+// A length in CSS px: 600px, 37.5em, 48rem (16 px), a plain number, calc(a - b); -1 if none.
+static float media_len(Cur *c) {
+    skip_ws(c);
+    if (c->end - c->p >= 5 && iprefix(c->p, 5, "calc(")) {
+        c->p += 5;
+        float a = media_len(c);
+        skip_ws(c);
+        char op = c->p < c->end ? *c->p : 0;
+        if (op == '-' || op == '+') {
+            c->p++;
+            float b = media_len(c);
+            if (a >= 0 && b >= 0) a = op == '-' ? a - b : a + b;
+        }
+        while (c->p < c->end && *c->p != ')') c->p++;
+        if (c->p < c->end) c->p++;
+        return a;
+    }
+    float v = 0, scale = 0;
+    int any = 0;
+    while (c->p < c->end && (is_digit((u8)*c->p) || *c->p == '.')) {
+        if (*c->p == '.') scale = 1;
+        else {
+            any = 1;
+            if (scale) { scale /= 10; v += (float)(*c->p - '0') * scale; }
+            else v = v * 10 + (float)(*c->p - '0');
+        }
+        c->p++;
+    }
+    if (!any) return -1;
+    if (c->end - c->p >= 2 && iprefix(c->p, 2, "px")) c->p += 2;
+    else if (c->end - c->p >= 3 && iprefix(c->p, 3, "rem")) { c->p += 3; v *= 16; }
+    else if (c->end - c->p >= 2 && iprefix(c->p, 2, "em")) { c->p += 2; v *= 16; }
+    return v;
+}
+
+static int media_op(Cur *c) {  // 1 <, 2 <=, 3 >, 4 >=, 5 =; 0 none
+    skip_ws(c);
+    if (c->p >= c->end) return 0;
+    char ch = *c->p;
+    if (ch == '=') { c->p++; return 5; }
+    if (ch != '<' && ch != '>') return 0;
+    c->p++;
+    int eq = c->p < c->end && *c->p == '=';
+    if (eq) c->p++;
+    return (ch == '<' ? 1 : 3) + eq;
+}
+
+static int media_cmp(float a, int op, float b) {
+    return op == 1 ? a < b : op == 2 ? a <= b : op == 3 ? a > b : op == 4 ? a >= b : a == b;
+}
+
+// 1 / 0 for a range feature (inside its parentheses), -1 if it is not one.
+static int media_range(Cur f, float vw, float vh) {
+    skip_ws(&f);
+    if (f.p >= f.end) return -1;
+    if (is_digit((u8)*f.p) || *f.p == '.' || iprefix(f.p, (int)(f.end - f.p), "calc(")) {  // 400px <= width [< 900px]
+        float a = media_len(&f);
+        int op = media_op(&f);
+        skip_ws(&f);
+        const char *name = read_ident(&f, 1);
+        if (a < 0 || !op || !name) return 0;
+        float v = ieq(name, "width") ? vw : ieq(name, "height") ? vh : -1;
+        if (v < 0 || !media_cmp(a, op, v)) return 0;
+        int op2 = media_op(&f);
+        if (!op2) return 1;
+        float b = media_len(&f);
+        return b >= 0 && media_cmp(v, op2, b);
+    }
+    const char *name = read_ident(&f, 1);
+    int op = media_op(&f);
+    if (!name || !op) return -1;
+    float v = ieq(name, "width") ? vw : ieq(name, "height") ? vh : -1, b = media_len(&f);
+    return v >= 0 && b >= 0 && media_cmp(v, op, b);
+}
+
 static int media_matches(const char *s, const char *e) {
     // comma = OR; each part: [not|only] [type] [and (feature)]*
     Cur c = {s, e};
@@ -369,6 +458,11 @@ static int media_matches(const char *s, const char *e) {
                 const char *fs = q.p + 1;
                 skip_balanced(&q);
                 Cur f = {fs, q.p - 1};
+                int range = media_range(f, W / S, H / S);
+                if (range >= 0) {
+                    ok &= range;
+                    continue;
+                }
                 skip_ws(&f);
                 const char *name = read_ident(&f, 1);
                 skip_ws(&f);
@@ -478,6 +572,58 @@ static void set_lp(Decl *d, int prop, int val, u8 unit, int imp) {
     d->lhas[prop] = (u8)(imp ? 2 : 1);
 }
 
+// margin, padding and their -top/-right/-bottom/-left, -inline, -block, -inline-start/end
+// and -block-start/end forms (left to right, top to bottom). Values we can't read (var(),
+// calc()) leave the whole declaration out.
+static void box_sides(Decl *d, const char *ns, int nl, const char *vs, const char *ve, int imp) {
+    int pad = lower(ns[0]) == 'p', base = pad ? LP_PT : LP_MT, k = pad ? 7 : 6;  // after "padding" / "margin"
+    const char *sub = ns + k;
+    int sl = nl - k;
+    int v[4], n = 0, val;
+    u8 u[4], unit;
+    const char *q = vs;
+    while (n < 4 && read_len(&q, ve, &val, &unit)) {
+        if (pad && unit == U_AUTO) return;
+        v[n] = val; u[n] = unit; n++;
+        while (q < ve && is_space((u8)*q)) q++;
+    }
+    if (!n || q < ve) return;
+    // which sides (top, right, bottom, left) get which value
+    int side[4] = {-1, -1, -1, -1};
+    if (sl == 0) {
+        static const u8 map[4][4] = {{0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
+        for (int i = 0; i < 4; i++) side[i] = map[n - 1][i];
+    } else if (n == 1 && (value_is(sub, ns + nl, "-top") || value_is(sub, ns + nl, "-block-start"))) side[0] = 0;
+    else if (n == 1 && (value_is(sub, ns + nl, "-right") || value_is(sub, ns + nl, "-inline-end"))) side[1] = 0;
+    else if (n == 1 && (value_is(sub, ns + nl, "-bottom") || value_is(sub, ns + nl, "-block-end"))) side[2] = 0;
+    else if (n == 1 && (value_is(sub, ns + nl, "-left") || value_is(sub, ns + nl, "-inline-start"))) side[3] = 0;
+    else if (n <= 2 && sl == 7 && value_is(sub, ns + nl, "-inline")) { side[3] = 0; side[1] = n - 1; }
+    else if (n <= 2 && sl == 6 && value_is(sub, ns + nl, "-block")) { side[0] = 0; side[2] = n - 1; }
+    else return;
+    for (int i = 0; i < 4; i++)
+        if (side[i] >= 0) set_lp(d, base + i, v[side[i]], u[side[i]], imp);
+}
+
+// The colour in a background (shorthand) value: #hex, rgb(), a name; 0 if it has none.
+static int parse_color(const char *s, int len, u32 *out);
+static int background_colour(const char *vs, const char *ve, u32 *col) {
+    const char *p = vs;
+    while (p < ve) {
+        while (p < ve && is_space((u8)*p)) p++;
+        const char *t = p;
+        int depth = 0;
+        while (p < ve && !(depth == 0 && is_space((u8)*p))) {
+            if (*p == '(') depth++;
+            if (*p == ')') depth--;
+            p++;
+        }
+        if (p > t && !value_is(t, p, "url(") && !value_is(t, p, "var(") && !value_is(t, p, "linear-gradient") &&
+            parse_color(t, (int)(p - t), col))
+            return 1;
+    }
+    return 0;
+}
+
 static int keyword(const char *v, const char *e, const char *const *words, int n) {  // 1 + index, 0 = none
     for (int i = 0; i < n; i++)
         if (value_is(v, e, words[i])) return i + 1;
@@ -560,6 +706,20 @@ static void scan_decls(const char *s, const char *e, Decl *d) {
             static const u8 as[] = {1, 1, 1, 1, 1, 2, 3, 3, 3, 4, 5, 6};
             int k = keyword(vs, ve, w, 12);
             if (k) set_lp(d, LP_JUSTIFY, as[k - 1], U_NUM, imp);
+        } else if ((nl == 6 && iprefix(ns, 6, "margin")) || (nl == 7 && iprefix(ns, 7, "padding")) ||
+                   (nl >= 10 && (iprefix(ns, 7, "margin-") || iprefix(ns, 8, "padding-")))) {
+            box_sides(d, ns, nl, vs, ve, imp);
+        } else if ((nl == 16 && iprefix(ns, 16, "background-color")) || (nl == 10 && iprefix(ns, 10, "background"))) {
+            u32 col;
+            if (value_is(vs, ve, "none") || value_is(vs, ve, "transparent")) set_lp(d, LP_BG, 0, U_NUM, imp);
+            else if (background_colour(vs, ve, &col)) set_lp(d, LP_BG, (int)col, U_NUM, imp);
+        } else if (nl == 5 && iprefix(ns, 5, "order")) {
+            if (read_len(&q, ve, &val, &unit) && unit == U_NUM) set_lp(d, LP_ORDER, val / 100, U_NUM, imp);
+        } else if (nl == 10 && iprefix(ns, 10, "align-self")) {
+            static const char *const w[] = {"stretch", "normal", "flex-start", "start", "self-start", "baseline", "center", "flex-end", "end", "self-end"};
+            static const u8 as[] = {1, 1, 2, 2, 2, 2, 3, 4, 4, 4};
+            int k = keyword(vs, ve, w, 10);
+            if (k) set_lp(d, LP_ASELF, as[k - 1], U_NUM, imp);
         } else if (nl == 11 && iprefix(ns, 11, "align-items")) {
             static const char *const w[] = {"stretch", "normal", "flex-start", "start", "self-start", "baseline", "center", "flex-end", "end", "self-end"};
             static const u8 as[] = {1, 1, 2, 2, 2, 2, 3, 4, 4, 4};
@@ -635,10 +795,12 @@ static void scan_decls(const char *s, const char *e, Decl *d) {
                 if (q < ve && (*q == '0' || *q == '1')) clipped = 1;
             }
         } else if (nl == 9 && iprefix(ns, 9, "clip-path")) {
-            if (value_is(vs, ve, "inset(50%") || value_is(vs, ve, "inset(100%")) clipped = 1;
+            if (value_is(vs, ve, "inset(50%") || value_is(vs, ve, "inset(100%") || value_is(vs, ve, "rect(0")) clipped = 1;
         }
     }
-    if ((abs_pos && clipped) || far_left) d->sr = 1;
+    // (taken out of the flow and 1px wide: GitHub's .sr-only, with a clip we may not know)
+    int speck = abs_pos && d->lhas[LP_WIDTH] && d->lunit[LP_WIDTH] == U_PX && d->lval[LP_WIDTH] <= 100;
+    if ((abs_pos && clipped) || far_left || speck) d->sr = 1;
 }
 
 static int css_order;
@@ -810,13 +972,16 @@ static int match_from(Node *n, const Rule *r, int i) {
     return 0;
 }
 
+#define PASS0_MASK ((1u << LP_FLOAT) | (1u << LP_CLEAR))
+
 // Rules indexed by what their rightmost compound needs: an id, a class, a tag, or nothing.
 typedef struct { const char *key; int rule, next; } Bucket;
 #define CSS_HASH 4096
-// Two indexes: [0] the rules every element needs (display, visibility, float, clear), [1] the
-// rules with LP_ITEM_MASK properties (lay_items). A rule with both kinds is in both.
-static int *css_heads[2];    // CSS_HASH heads for id/class keys
-static int tag_heads[2][T_COUNT + 1], any_head[2] = {-1, -1};
+// Three indexes: [0] the rules every element needs (display, visibility, float, clear), [1]
+// the rules with LP_ITEM_MASK properties (lay_items), [2] the rules with a box's spacing and
+// colour (box_css). A rule with several kinds is in each of their indexes.
+static int *css_heads[3];    // CSS_HASH heads for id/class keys
+static int tag_heads[3][T_COUNT + 1], any_head[3] = {-1, -1, -1};
 static Bucket *buckets;
 static int nbuckets, buckets_cap;
 
@@ -845,12 +1010,13 @@ static void index_rule(int i, int set) {
 
 static void index_both(int i) {  // into the index(es) of what it sets
     const Rule *r = &rules[i];
-    if (r->d.disp || r->d.vis || r->d.sr || (r->lmask & ~LP_ITEM_MASK)) index_rule(i, 0);
+    if (r->d.disp || r->d.vis || r->d.sr || (r->lmask & PASS0_MASK)) index_rule(i, 0);
     if (r->lmask & LP_ITEM_MASK) index_rule(i, 1);
+    if (r->lmask & LP_BOXPASS_MASK) index_rule(i, 2);
 }
 
 static void index_rules(void) {
-    for (int set = 0; set < 2; set++) {
+    for (int set = 0; set < 3; set++) {
         if (!css_heads[set]) css_heads[set] = (int *)must_alloc(CSS_HASH * sizeof(int));
         for (int i = 0; i < CSS_HASH; i++) css_heads[set][i] = -1;
         for (int i = 0; i <= T_COUNT; i++) tag_heads[set][i] = -1;
@@ -861,7 +1027,8 @@ static void index_rules(void) {
 }
 
 static int best_disp, best_vis, sr_hit, best_lp[LP_COUNT];
-static int item_pass;  // the cascade is looking up the LP_ITEM_MASK properties (else all but them)
+static int item_pass;  // which properties the cascade looks up: 0 display, float, clear; 1 LP_ITEM_MASK; 2 LP_BOXPASS_MASK
+static const u32 pass_mask[3] = {PASS0_MASK, LP_ITEM_MASK, LP_BOXPASS_MASK};
 static const u64 *cur_anc;  // anc_bloom of the element being styled
 
 static int beats(const Rule *r, int imp, int best, int best_imp) {
@@ -873,7 +1040,7 @@ static int beats(const Rule *r, int imp, int best, int best_imp) {
 
 static void consider_rule(Node *n, int ri) {
     const Rule *r = &rules[ri];
-    u32 lm = r->lmask & (item_pass ? LP_ITEM_MASK : ~LP_ITEM_MASK);
+    u32 lm = r->lmask & pass_mask[item_pass];
     if (!lm && (item_pass || (!r->d.disp && !r->d.vis && !r->d.sr))) return;  // nothing this pass looks for
     int want_disp = !item_pass && r->d.disp && beats(r, r->d.imp_disp, best_disp, best_disp >= 0 ? rules[best_disp].d.imp_disp : 0);
     int want_vis = !item_pass && r->d.vis && beats(r, r->d.imp_vis, best_vis, best_vis >= 0 ? rules[best_vis].d.imp_vis : 0);
@@ -946,7 +1113,7 @@ static int css_node(Node *c) {
         int any = 0;
         if (best_disp >= 0) lay.disp = rules[best_disp].d.ldisp;
         for (int i = 0; i < LP_COUNT; i++)
-            if (best_lp[i] >= 0) {
+            if ((PASS0_MASK & (1u << i)) && best_lp[i] >= 0) {
                 const Decl *d = &rules[best_lp[i]].d;
                 lay.has[i] = 1; lay.unit[i] = d->lunit[i]; lay.val[i] = d->lval[i];
                 any = 1;
@@ -959,7 +1126,7 @@ static int css_node(Node *c) {
             if (in.vis && !(best_vis >= 0 && rules[best_vis].d.imp_vis)) vis = in.vis;
             if (in.sr) sr_hit = 1;
             for (int i = 0; i < LP_COUNT; i++)
-                if (in.lhas[i] && !(best_lp[i] >= 0 && rules[best_lp[i]].d.lhas[i] == 2)) {
+                if ((PASS0_MASK & (1u << i)) && in.lhas[i] && !(best_lp[i] >= 0 && rules[best_lp[i]].d.lhas[i] == 2)) {
                     lay.has[i] = 1; lay.unit[i] = in.lunit[i]; lay.val[i] = in.lval[i];
                     any = 1;
                 }
@@ -1007,9 +1174,47 @@ static Lay *lay_items(Node *c) {
     return l;
 }
 
+// c's margin, padding, background, width and max-width (LP_BOXPASS_MASK), for a block
+// layout reaches; 0 if it has none (most elements: then nothing is kept for it).
+static const Lay *box_css(Node *c) {
+    if (c->type != N_ELEM) return 0;
+    css_hidden(c);
+    if (c->box_ep == css_epoch) return c->box;
+    c->box_ep = css_epoch;
+    c->box = 0;
+    item_pass = 2;
+    cascade(c);
+    item_pass = 0;
+    Lay l;
+    __builtin_memset(&l, 0, sizeof l);
+    int any = 0;
+    for (int i = 0; i < LP_COUNT; i++)
+        if ((LP_BOXPASS_MASK & (1u << i)) && best_lp[i] >= 0) {
+            const Decl *d = &rules[best_lp[i]].d;
+            l.has[i] = 1; l.unit[i] = d->lunit[i]; l.val[i] = d->lval[i];
+            any = 1;
+        }
+    const char *st = attr(c, "style");
+    if (st) {
+        Decl in;
+        scan_decls(st, st + lw_strlen(st), &in);
+        for (int i = 0; i < LP_COUNT; i++)
+            if ((LP_BOXPASS_MASK & (1u << i)) && in.lhas[i] && !(best_lp[i] >= 0 && rules[best_lp[i]].d.lhas[i] == 2)) {
+                l.has[i] = 1; l.unit[i] = in.lunit[i]; l.val[i] = in.lval[i];
+                any = 1;
+            }
+    }
+    if (any) {
+        c->box = (Lay *)arena(sizeof(Lay));
+        *c->box = l;
+    }
+    return c->box;
+}
+
 static void css_reset(Node *n) {
     for (Node *c = n->first; c; c = c->next) {
         c->css_ep = 0;
+        c->box_ep = 0;
         css_reset(c);
     }
 }
