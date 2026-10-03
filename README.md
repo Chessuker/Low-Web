@@ -2,185 +2,224 @@
 
 [![CI](https://github.com/Chessuker/Low-Web/actions/workflows/ci.yml/badge.svg)](https://github.com/Chessuker/Low-Web/actions/workflows/ci.yml)
 
-เว็บที่ไม่มี HTML, CSS หรือ JavaScript และ browser ที่เขียนขึ้นเองสำหรับมัน
+A web without HTML, CSS or JavaScript, and a browser written from scratch for it.
 
-หน้าเว็บของ Low-web คือโปรแกรม WebAssembly หนึ่งไฟล์ (`index.wasm`) ที่วาดพิกเซลเองทั้งหมด
-ส่วน browser (C++ ล้วน ไม่มี framework) ทำหน้าที่เหมือน "เครื่อง" ให้โปรแกรมนั้นรัน:
-ดาวน์โหลดผ่าน HTTP/HTTPS, รันด้วย interpreter ของตัวเอง, แล้วเอาพิกเซลที่ได้ขึ้นจอ
+A Low-web page is a single WebAssembly program (`index.wasm`) that draws every pixel itself.
+The browser (plain C++, no framework) is the "machine" that program runs on: it downloads it
+over HTTP/HTTPS, runs it in its own interpreter, and puts the pixels it produces on the screen.
 
-เว็บ HTML ปกติก็เปิดได้ด้วย: browser ส่งเอกสาร HTML ให้ **viewer** ซึ่งเป็นหน้า Low-web
-อีกหน้าหนึ่ง (เขียนด้วย C) ที่อ่าน HTML แล้ววาดออกมาแบบ reader view ตัว browser เองจึงยังไม่รู้จัก HTML
+Ordinary HTML sites open too: the browser hands the HTML document to the **viewer**, which is
+just another Low-web page (written in C) that reads HTML and draws it as a reader view. The
+browser itself still knows nothing about HTML.
 
 ```
  ┌──────────── lowweb.exe (C++, Win32) ─────────────┐        ┌──── lowd (C++) ────┐
  │ address bar ─► net.cpp  HTTP/1.1, HTTP/2 + TLS    ├──TCP──►│ static files       │
  │                 │        gzip (inflate.cpp)       │        │ /  → /index.wasm   │
  │                 ▼                                 │        └────────────────────┘
- │   index.wasm? ──► รันหน้านั้นเลย                                                 │
- │   HTML?  ───────► viewer.wasm (ฝังอยู่ใน exe) + เอกสาร HTML                      │
+ │   index.wasm? ──► run that page                                                 │
+ │   HTML?  ───────► viewer.wasm (built into the exe) + the HTML document          │
  │                                                                                 │
- │ wasm.cpp  WebAssembly interpreter  ◄── หน้าเว็บ (C → wasm32)                    │
+ │ wasm.cpp  WebAssembly interpreter  ◄── the page (C → wasm32)                    │
  │   │  imports "lw.*"  (sdk/lowweb.h)                                             │
- │   ├─ lw_present ──► framebuffer ─► StretchDIBits (จอ)                           │
- │   ├─ lw_text ─────► GDI + Uniscribe (ทุกภาษา รวมถึงไทย ตัดคำไทยถูก)              │
- │   ├─ lw_image_decode ► PNG / JPEG / GIF / WebP / SVG / BMP (เขียนเองทั้งหมด)      │
- │   ├─ lw_video_* ──► Media Foundation ของ Windows (video.cpp: ถอดรหัสบน GPU)      │
+ │   ├─ lw_present ──► framebuffer ─► StretchDIBits (screen)                       │
+ │   ├─ lw_text ─────► GDI + Uniscribe (every script, Thai word breaking included) │
+ │   ├─ lw_image_decode ► PNG / JPEG / GIF / WebP / SVG / BMP (all written here)   │
+ │   ├─ lw_video_* ──► Windows Media Foundation (video.cpp: decoded on the GPU)    │
  │   └─ lw_fetch / lw_navigate(_post) / lw_open_file / lw_save_file               │
  └──────────────────────────────────────────────────┘
 ```
 
-## โครงสร้าง
+## Layout of the repository
 
-| โฟลเดอร์ | อะไร |
+| Folder | What |
 |---|---|
-| `browser/` | ตัว browser: `main.cpp` (หน้าต่าง, แท็บ, address bar, host ของ page ABI), `wasm.cpp` (interpreter), `net.cpp` (URL, HTTP/1.1 + keep-alive), `http2.cpp` (HTTP/2 + HPACK), `conn.h` (TCP + TLS ผ่าน SChannel), `cache.cpp` (HTTP cache), `cookies.cpp` (cookie), `inflate.cpp` (DEFLATE/gzip), `image.cpp` (PNG/JPEG/GIF/BMP), `webp.cpp` (WebP lossy + lossless), `svg.cpp` (SVG renderer), `video.cpp` (วิดีโอ/เสียงผ่าน Media Foundation) |
-| `server/lowd.cpp` | web server สำหรับ host เว็บ Low-web (Windows + Linux) |
-| `sdk/lowweb.h` | **Page ABI**: สัญญาระหว่างหน้าเว็บกับ browser |
-| `sdk/hello.c` | หน้าเว็บตัวอย่างที่เล็กที่สุด (~1 KB) ใช้เป็นแม่แบบ |
-| `sites/home/`, `sites/paint/` | source ของหน้าเว็บตัวอย่าง |
-| `sites/viewer/` | **HTML viewer**: `viewer.c` (HTML → layout → วาด) และ `css.c` (CSS เท่าที่จำเป็น) |
-| `sites/www/` | **web root** ที่ host จริง (`index.wasm`, `paint/index.wasm`, `motd.txt`, `about.txt`) |
-| `tests/` | ชุดทดสอบ interpreter / decoder / network / cache, ไฟล์ตัวอย่าง (`tests/samples/`: `gen_*` สร้างด้วย `tests/gen_samples.py` จากภาพที่วาดเองแต่เขียนด้วย encoder จริง ให้มีลักษณะแบบไฟล์บนเว็บ; `real_w3c.svg` (CC-BY, เครดิตอยู่ในไฟล์), ธงชาติไทย, RFC 7541) และสคริปต์ช่วยพัฒนา (`dev.sh`, `shot.sh`, `slow_server.py`) |
-| `build/` | ของที่ build สร้าง (`viewer.wasm`, `lowweb_res.o`, `lowd.exe`, `ops.wasm`) และผลทดสอบชั่วคราว ลบทิ้งได้ทั้งโฟลเดอร์ (`source-backups.zip` คือ source ก่อนแก้รอบใหญ่ ๆ เก็บไว้เผื่อย้อนดู) |
-| `legacy/paint-html/` | paint เวอร์ชันเดิมที่ยังพึ่ง HTML + JS |
+| `browser/` | The browser: `main.cpp` (window, tabs, address bar, host of the page ABI), `wasm.cpp` (interpreter), `net.cpp` (URLs, HTTP/1.1 + keep-alive), `http2.cpp` (HTTP/2 + HPACK), `conn.h` (TCP + TLS through SChannel), `cache.cpp` (HTTP cache), `cookies.cpp` (cookies), `inflate.cpp` (DEFLATE/gzip), `image.cpp` (PNG/JPEG/GIF/BMP), `webp.cpp` (WebP lossy + lossless), `svg.cpp` (SVG renderer), `video.cpp` (video/audio through Media Foundation) |
+| `server/lowd.cpp` | A web server for hosting Low-web sites (Windows + Linux) |
+| `sdk/lowweb.h` | **The page ABI**: the contract between a page and the browser |
+| `sdk/hello.c` | The smallest example page (~1 KB), to start from |
+| `sites/home/`, `sites/paint/` | Sources of the example pages |
+| `sites/viewer/` | **The HTML viewer**: `viewer.c` (HTML → layout → drawing) and `css.c` (as much CSS as it needs) |
+| `sites/www/` | **The web root** that gets hosted (`index.wasm`, `paint/index.wasm`, `motd.txt`, `about.txt`) |
+| `tests/` | Tests of the interpreter, decoders, network and cache; sample files (`tests/samples/`: `gen_*` are made by `tests/gen_samples.py` from pictures drawn there but written by real encoders, so they look like files on the web; `real_w3c.svg` (CC-BY, credit inside the file), the Thai flag, RFC 7541); development scripts (`dev.sh`, `shot.sh`, `slow_server.py`) |
+| `build/` | What the build makes (`viewer.wasm`, `lowweb_res.o`, `lowd.exe`, `ops.wasm`) and temporary test output; the whole folder can be deleted |
+| `legacy/paint-html/` | The old version of Paint, which still relied on HTML + JS |
 
 ## Build
 
-ต้องมี **g++ (MinGW-w64)** และ **clang ที่มี target wasm32** (LLVM)
+You need **g++ (MinGW-w64)** and **clang with the wasm32 target** (LLVM).
 
 ```bat
 build.cmd
 ```
 
-ได้ `bin\lowweb.exe` (browser ที่ฝัง viewer ไว้แล้ว), `bin\lowd.exe` (server), `sites\www\**\index.wasm`
-และเครื่องมือทดสอบ ถ้า `lowd.exe` กำลังรันอยู่ build จะไม่เขียนทับ (ตัวใหม่อยู่ที่ `build\lowd.exe`)
+This makes `bin\lowweb.exe` (the browser, with the viewer built in), `bin\lowd.exe` (the server),
+`sites\www\**\index.wasm` and the test tools. If `lowd.exe` is running, the build doesn't
+overwrite it (the new one is in `build\lowd.exe`).
 
-ระหว่างพัฒนา viewer: วาง `viewer.wasm` ไว้ข้าง `lowweb.exe` แล้ว browser จะใช้ไฟล์นั้นแทนตัวที่ฝังไว้
-ไม่ต้อง build exe ใหม่ (`bash tests/dev.sh` ทำให้; `bash tests/shot.sh NAME URL` เปิดหน้าแล้วเก็บภาพเป็น PNG ที่ `build/shots/`)
+While working on the viewer: put `viewer.wasm` next to `lowweb.exe` and the browser uses that
+file instead of the built-in one, so there is no need to rebuild the exe (`bash tests/dev.sh`
+does it; `bash tests/shot.sh NAME URL` opens a page and saves a PNG screenshot in `build/shots/`).
 
-## ใช้งาน
+## Use
 
 ```bat
-bin\lowweb.exe                         :: เปิดเว็บตัวอย่างจากดิสก์ (sites\www)
-bin\lowd.exe sites\www                 :: เปิด server ที่พอร์ต 8080
-bin\lowweb.exe http://localhost:8080/  :: เปิดผ่าน network จริง
-bin\lowweb.exe https://th.wikipedia.org/wiki/ภาษาไทย   :: เว็บ HTML ปกติ (reader view)
+bin\lowweb.exe                         :: the example site, straight from disk (sites\www)
+bin\lowd.exe sites\www                 :: a server on port 8080
+bin\lowweb.exe http://localhost:8080/  :: the same over the real network
+bin\lowweb.exe https://en.wikipedia.org/wiki/Bangkok   :: an ordinary HTML site (reader view)
 ```
 
-คีย์ลัด:
+Keys:
 
-| คีย์ | ทำอะไร |
+| Key | What it does |
 |---|---|
-| `Ctrl+L` | ไปที่ช่อง address (พิมพ์ URL หรือคำค้นหาก็ได้) |
-| `Ctrl+T` / `Ctrl+W` | เปิด / ปิดแท็บ |
-| `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+1`…`9` | สลับแท็บ |
-| `Ctrl+Shift+T` | เปิดแท็บที่เพิ่งปิดกลับมา |
-| `Alt+Enter` ในช่อง address | เปิดในแท็บใหม่ |
-| คลิกกลาง / `Ctrl`+คลิกลิงก์ | เปิดลิงก์ในแท็บเบื้องหลัง |
-| `F5` · `Ctrl+F5` · `Alt+←/→` · `Alt+Home` | reload (ถาม server ว่าเปลี่ยนไหม) · reload โดยไม่ใช้ cache · back/forward · home |
-| `F11` · `Esc` | เต็มจอ (ไม่มีแถบแท็บและ toolbar) · ออกจากเต็มจอ |
-| `Ctrl+F` · `Enter`/`F3` · `Shift+Enter`/`Shift+F3` · `Esc` | ค้นหาในหน้า (แถบมุมขวาบน บอก "ลำดับ/ทั้งหมด", ไม่สนตัวพิมพ์เล็กใหญ่) · อันถัดไป · อันก่อนหน้า · ปิด |
+| `Ctrl+L` | Go to the address bar (type an address or words to search for) |
+| `Ctrl+T` / `Ctrl+W` | Open / close a tab |
+| `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+1`…`9` | Switch tabs |
+| `Ctrl+Shift+T` | Reopen the tab closed last |
+| `Alt+Enter` in the address bar | Open in a new tab |
+| Middle click / `Ctrl`+click on a link | Open the link in a background tab |
+| `F5` · `Ctrl+F5` · `Alt+←/→` · `Alt+Home` | Reload (asks the server whether it changed) · reload without the cache · back/forward · home |
+| `F11` · `Esc` | Fullscreen (no tab strip, no toolbar) · leave fullscreen |
+| `Ctrl+F` · `Enter`/`F3` · `Shift+Enter`/`Shift+F3` · `Esc` | Find in page (a bar at the top right shows "current/total", case-insensitive) · next · previous · close |
 
-ลากไฟล์ `.wasm` มาวางเพื่อรัน · ลากรูปมาวางบน Paint เพื่อเปิดรูป
+Drop a `.wasm` file on the window to run it · drop a picture on Paint to open it.
 
-**เลือก คัดลอก วางข้อความ**: ลากเมาส์เพื่อเลือก, ดับเบิลคลิก = คำ, คลิกสามครั้ง = ทั้งย่อหน้า, `Shift`+คลิก = ขยายส่วนที่เลือก,
-`Ctrl+A` เลือกทั้งหน้า, `Ctrl+C` คัดลอก (ขึ้นบรรทัดใหม่ตามหน้า), ลากเลยขอบบน/ล่างแล้วหน้าเลื่อนตาม; ในช่องกรอก `Ctrl+V` วาง,
-`Ctrl+A` แล้ว `Ctrl+C`/`Ctrl+X` คัดลอก/ตัด (ช่องรหัสผ่านคัดลอกไม่ได้); หน้าที่ browser แสดงเอง (ไฟล์ข้อความ, หน้า error) ก็เลือกและคัดลอกได้
+**Selecting, copying, pasting text**: drag to select, double-click = a word, triple-click = the
+paragraph, `Shift`+click = extend the selection, `Ctrl+A` = the whole page, `Ctrl+C` copies (with
+the page's line breaks); dragging past the top or bottom edge scrolls. In text fields: `Ctrl+V`
+pastes, `Ctrl+A` then `Ctrl+C`/`Ctrl+X` copies/cuts (password fields can't be copied). The pages
+the browser shows itself (text files, error pages) can be selected and copied as well.
 
-**ช่องกรอก**: มี caret และส่วนที่เลือก: `←/→` (`Ctrl` = ทีละคำ), `Home/End`, `Shift`+ปุ่มเหล่านี้ = เลือก, `Backspace`/`Delete`
-(`Ctrl` = ทั้งคำ), คลิกวาง caret, ลากเลือก, ดับเบิลคลิก = คำ, คลิกสามครั้ง = ทั้งหมด, `Tab`/`Shift+Tab` ไปช่องถัดไป/ก่อนหน้า;
-ข้อความยาวเลื่อนตาม caret; `<textarea>` ตัดบรรทัดเอง, `Enter` ขึ้นบรรทัดใหม่, `↑/↓` ทีละบรรทัด; สระ/วรรณยุกต์ไทยไปกับตัวอักษรข้างหน้า
-(ลบด้วย `Backspace` ได้ทีละตัว)
-หน้า Low-web ใช้ clipboard ผ่าน `lw_clipboard_set`/`lw_clipboard_get`: เขียนได้เฉพาะตอนจัดการ input ของผู้ใช้
-และอ่านได้เฉพาะตอนผู้ใช้กด `Ctrl+V`/`Shift+Insert` เท่านั้น หน้าเว็บจึงแอบอ่านหรือเขียนทับ clipboard ไม่ได้
+**Text fields**: a caret and a selection: `←/→` (`Ctrl` = by word), `Home/End`, `Shift` + these
+= select, `Backspace`/`Delete` (`Ctrl` = a whole word), click to place the caret, drag to select,
+double-click = a word, triple-click = all of it, `Tab`/`Shift+Tab` = next/previous field. Long
+text scrolls with the caret; `<textarea>` wraps its lines, `Enter` starts a new line, `↑/↓` move by
+line; Thai vowels and tone marks stay with the letter before them (`Backspace` removes them one
+at a time).
+Low-web pages use the clipboard through `lw_clipboard_set`/`lw_clipboard_get`: they can write it
+only while handling the user's input, and read it only while the user presses `Ctrl+V`/`Shift+Insert`,
+so a page can't read or overwrite the clipboard behind the user's back.
 
-**แถบแท็บคือ title bar**: หน้าต่างไม่มี title bar ของ Windows แล้ว แถบแท็บอยู่บนสุดแทนแบบ browser ทั่วไป
-มีปุ่มย่อ/ขยาย/ปิดของตัวเองทางขวา, ลากที่ว่างบนแถบเพื่อย้ายหน้าต่าง, ดับเบิลคลิกที่ว่างเพื่อขยายเต็มจอ, คลิกขวาที่ว่างได้เมนูของหน้าต่าง,
-ลากขอบบนเพื่อปรับขนาด; Aero Snap และ `Win+←/→/↑` ใช้ได้ตามปกติ
+**The tab strip is the title bar**: the window has no Windows title bar; the tab strip is at the
+very top, as in other browsers. It has its own minimize/maximize/close buttons on the right; drag
+an empty part of it to move the window, double-click there to maximize, right-click there for the
+window menu, drag the top edge to resize. Aero Snap and `Win+←/→/↑` work as usual.
 
-**ค้นหาจากช่อง address**: ถ้าสิ่งที่พิมพ์ไม่ใช่ address (มีช่องว่าง, ไม่มีจุด, ขึ้นต้นด้วย `?`) จะค้นหาแทน
-ปุ่มเล็กข้างช่อง address ใช้เลือก search engine: **DuckDuckGo** (ค่าเริ่มต้น), **Google**, **Bing**
-ค่าที่เลือกเก็บไว้ที่ `%APPDATA%\Low-web\settings.ini`
-(Google ต้องใช้ JavaScript กับหน้าผลค้นหาแล้ว จึงจะได้หน้า "เปิด JavaScript" แทนผลลัพธ์)
+**Searching from the address bar**: if what you type isn't an address (it has spaces, no dot, or
+starts with `?`), it is searched for. The small button next to the address bar picks the search
+engine: **DuckDuckGo** (the default), **Google**, **Bing**. The choice is kept in
+`%APPDATA%\Low-web\settings.ini`. (Google's result pages now need JavaScript, so you get its
+"turn on JavaScript" page instead of results.)
 
-**Network, cache และ cookie**
-- **HTTP/2** (RFC 9113) สำหรับ HTTPS ที่ server รองรับ (ตกลงกันผ่าน ALPN ตอน TLS handshake): ทุก request ไปที่ server เดียวกัน
-  ใช้ connection เดียว (หน้า Wikipedia: 3 connection แทน 10), HPACK เขียนเองรวม Huffman (ตารางสร้างจาก RFC 7541 ด้วย
-  `tests/gen_hpack_huffman.py`); server ที่ตอบเป็น HTTP/1.1 จะถูกจำไว้ ไม่ต้องลองใหม่ทุกครั้ง
-- **Keep-alive** (HTTP/1.1): connection ที่ใช้เสร็จจะถูกเก็บไว้ใช้กับ request ถัดไปที่ server เดียวกัน (สูงสุด 16 เส้น นาน 60 วินาที)
-  ไม่ต้อง handshake TCP + TLS ใหม่ทุกครั้ง; ถ้า server ปิด connection ที่เก็บไว้ไปแล้ว จะส่ง request ใหม่บน connection ใหม่ให้เอง
-- **TLS session resumption**: connection ใหม่ไปยัง server ที่เคยต่อแล้วใช้ handshake แบบย่อ (Wikipedia: 78 → 31 ms)
-- **Cookie** (RFC 6265): `Domain`, `Path`, `Secure`, `HttpOnly`, `Max-Age`/`Expires`, `SameSite` (ไม่บอก = `Lax`),
-  prefix `__Host-`/`__Secure-`, ห้ามตั้งให้ public suffix (`.com`, `.co.th` …); **cookie ของเว็บอื่น (third-party) ไม่ส่งและไม่เก็บ**;
-  cookie ที่มีวันหมดอายุเก็บไว้ที่ `%LOCALAPPDATA%\Low-web\cookies.txt` ส่วน session cookie หายเมื่อปิด browser
-- **User-Agent** แบบ Chrome ต่อท้ายด้วย `Low-web/0.1` (เว็บที่กันบอทหรือ CDN ไม่บล็อก; DuckDuckGo html เดิมตอบหน้า bot check) และ **Referer** แบบค่าตั้งต้นของ browser
-  (`strict-origin-when-cross-origin`: origin เดียวกันได้ที่อยู่เต็ม, ต่าง origin ได้แค่ origin, HTTPS → HTTP / file / ที่อยู่ที่พิมพ์เองไม่ส่ง):
-  วิดีโอและรูปจากเว็บที่กัน hotlink จึงไม่ได้ 403 อีก; ยังไม่อ่าน `Referrer-Policy` / `<meta name=referrer>` ของหน้า
-- **HTTP cache**: ทำตาม `Cache-Control` (`max-age`, `no-cache`, `no-store`), `Expires`, `ETag`/`If-None-Match`,
-  `Last-Modified`/`If-Modified-Since` (ถ้า server ไม่บอกอายุ ใช้กฎ 10% ของ `Last-Modified` ไม่เกิน 1 วัน)
-  เก็บในหน่วยความจำ 16 MB (ไฟล์ละไม่เกิน 2 MB) และในดิสก์ที่ `%LOCALAPPDATA%\Low-web\Cache` ไม่เกิน 256 MB (ไฟล์ที่ไม่ได้ใช้นานที่สุดถูกลบก่อน)
-- หน้าที่พาไปหน้าอื่นเอง (ไม่ได้มาจากการคลิกหรือกดคีย์ เช่น `<meta refresh>` ของหน้า redirect) จะแทนที่รายการของตัวเองในประวัติ: Back จากหน้าปลายทางจึงกลับไปหน้าก่อนหน้า redirect เลย (แบบ Chrome)
-- `F5` ถาม server ว่าหน้าเปลี่ยนไหม, `Ctrl+F5` / `Ctrl+Shift+R` โหลดใหม่ทั้งหมด, back/forward ใช้ของใน cache ถ้า server ไม่ได้สั่งให้ถามทุกครั้ง
-- `lowweb.exe --no-cache` ไม่ใช้ cache, `--cache-dir DIR` ใช้โฟลเดอร์อื่น, `--cookie-file FILE`, `--no-http2`, `--sleep-tabs-after SECONDS`;
-  log (`--log`) มีบรรทัด `[net]` บอกทุก request ว่ามาจาก cache, connection เดิม/ใหม่, TLS แบบย่อ หรือ HTTP/2 stream ไหน
-  (ตอนรันด้วย `--script` cookie อยู่ในหน่วยความจำเท่านั้น ไม่ปนกับของผู้ใช้)
+**Network, cache and cookies**
+- **HTTP/2** (RFC 9113) for HTTPS servers that offer it (agreed through ALPN during the TLS
+  handshake): every request to the same server shares one connection (a Wikipedia page: 3
+  connections instead of 10); HPACK is written here, Huffman coding included (the table is
+  generated from RFC 7541 by `tests/gen_hpack_huffman.py`); servers that answer with HTTP/1.1 are
+  remembered, so there is no need to try again every time.
+- **Keep-alive** (HTTP/1.1): a finished connection is kept for the next request to the same server
+  (at most 16, for 60 seconds), which saves the TCP + TLS handshakes; if the server has closed a
+  kept connection meanwhile, the request is sent again on a new one.
+- **TLS session resumption**: a new connection to a server seen before uses the short handshake
+  (Wikipedia: 78 → 31 ms).
+- **Cookies** (RFC 6265): `Domain`, `Path`, `Secure`, `HttpOnly`, `Max-Age`/`Expires`, `SameSite`
+  (`Lax` when not given), the `__Host-`/`__Secure-` prefixes, no cookies for public suffixes
+  (`.com`, `.co.th` …); **cookies of other sites (third-party) are neither sent nor stored**;
+  cookies with an expiry date are kept in `%LOCALAPPDATA%\Low-web\cookies.txt`, session cookies go
+  away when the browser closes.
+- **User-Agent** in Chrome's form with `Low-web/0.1` at the end (sites behind bot walls and CDNs
+  don't block it; DuckDuckGo's html search used to answer with a bot check) and **Referer** as
+  browsers send it by default (`strict-origin-when-cross-origin`: the whole address to the same
+  origin, only the origin to others, none from HTTPS to HTTP, from files or for typed addresses),
+  so videos and pictures from sites with hotlink protection no longer get 403. A page's own
+  `Referrer-Policy` / `<meta name=referrer>` isn't read yet.
+- **HTTP cache**: follows `Cache-Control` (`max-age`, `no-cache`, `no-store`), `Expires`,
+  `ETag`/`If-None-Match`, `Last-Modified`/`If-Modified-Since` (when the server gives no lifetime,
+  10% of the age since `Last-Modified`, at most a day). Kept in memory (16 MB, at most 2 MB per
+  file) and on disk in `%LOCALAPPDATA%\Low-web\Cache` (at most 256 MB; the least recently used
+  files go first).
+- A page that moves on by itself (not from a click or a key, e.g. a redirect page's
+  `<meta refresh>`) takes its own place in the history: Back from where it led goes to the page
+  before the redirect (as in Chrome).
+- `F5` asks the server whether the page changed, `Ctrl+F5` / `Ctrl+Shift+R` load everything again,
+  back/forward use what is in the cache unless the server said to always ask.
+- `lowweb.exe --no-cache` uses no cache, `--cache-dir DIR` another folder, `--cookie-file FILE`,
+  `--no-http2`, `--sleep-tabs-after SECONDS`; the log (`--log`) has a `[net]` line for every
+  request saying whether it came from the cache, a kept or new connection, a resumed TLS session
+  or which HTTP/2 stream. (With `--script`, cookies are kept only in memory, apart from the user's.)
 
-**หน่วยความจำ**
-- **แท็บที่ไม่ได้ดูนาน 10 นาทีจะ "หลับ"**: หน้าถูกปิดเพื่อคืนหน่วยความจำ (viewer บนหน้าใหญ่ใช้ 20–40 MB) เหลือแค่ภาพย่อที่บีบอัดไว้
-  พอกลับมาที่แท็บจะโหลดใหม่จาก cache และกลับไปที่ตำแหน่งเดิม; หลับเฉพาะหน้า HTML ที่โหลดด้วย GET และยังไม่ได้พิมพ์อะไรลงไป
-  (หน้า Low-web อย่าง Paint มี state ของตัวเอง จึงไม่หลับ); ตั้งเวลาได้ด้วย `--sleep-tabs-after SECONDS` (`0` = ไม่หลับเลย)
-- back/forward และ reload กลับไปที่ตำแหน่งเดิมในหน้า (ส่งผ่าน `lw_state`/`lw_restore` ใน `sdk/lowweb.h`)
-- ภาพของแท็บเบื้องหลังเก็บแบบบีบอัด (run-length: 3.2 MB → ~0.3 MB), viewer ทิ้ง HTML ส่วนที่ parse แล้วระหว่างดาวน์โหลด,
-  allocator ของ viewer แบ่ง/รวมก้อนที่ว่าง, cache ความกว้างข้อความเก็บเป็น hash
-- วัดได้ (working set): Wikipedia "United States" 54 → 49 MB, 4 แท็บ 142 → 124 MB และ 66 MB เมื่อ 3 แท็บเบื้องหลังหลับ;
-  script command `mem` เขียนลง log ว่าหน่วยความจำไปอยู่ที่ไหน (wasm ของแต่ละแท็บ, ภาพ, cache)
+**Memory**
+- **Tabs not looked at for 10 minutes go to sleep**: the page is unloaded to give back its memory
+  (the viewer takes 20–40 MB on a big page), and only a compressed picture of it stays. Coming back
+  to the tab loads it again from the cache, at the same place. Only HTML pages loaded with GET and
+  not typed into go to sleep (Low-web pages such as Paint have state of their own, so they don't);
+  the time is set with `--sleep-tabs-after SECONDS` (`0` = never).
+- Back/forward and reload return to the same place in the page (through `lw_state`/`lw_restore`
+  in `sdk/lowweb.h`).
+- The pictures of background tabs are kept compressed (run-length: 3.2 MB → ~0.3 MB), the viewer
+  drops the HTML it has parsed while the page downloads, the viewer's allocator splits and joins
+  free blocks, and the text-width cache is a hash table.
+- Measured (working set): Wikipedia "United States" 54 → 49 MB, 4 tabs 142 → 124 MB, and 66 MB
+  when 3 background tabs are asleep; the script command `mem` writes to the log where the memory
+  goes (each tab's wasm, pictures, caches).
 
-**หน้าเว็บเข้าถึงอะไรได้บ้าง** (`net::Access` ใน `browser/net.h`)
+**What a page can reach** (`net::Access` in `browser/net.h`)
 
-หน้าเว็บอ่านผลของ `lw_fetch` ได้ทุกไบต์ (viewer ต้องถอดรูปและ CSS เอง) จึงต้องกันไม่ให้หน้าเว็บจากอินเทอร์เน็ต
-ใช้ browser เป็นทางเข้าไปหาของที่มีแค่เครื่องเราเข้าถึงได้ แบ่ง address เป็น 3 ระดับตาม IP **หลัง resolve DNS แล้ว**
-(ชื่อที่ชี้มา 127.0.0.1 ก็โดนกัน): **เครื่องนี้** (127.0.0.0/8, ::1), **วงแลน** (10/8, 172.16/12, 192.168/16, 169.254/16,
-100.64/10, fc00::/7, fe80::/10) และ **อินเทอร์เน็ต**
+A page reads every byte `lw_fetch` brings (the viewer decodes pictures and CSS itself), so pages
+from the internet must not use the browser to get at what only this computer can reach. Addresses
+fall into 3 levels by IP **after DNS resolution** (a name pointing at 127.0.0.1 is caught too):
+**this computer** (127.0.0.0/8, ::1), **the local network** (10/8, 172.16/12, 192.168/16,
+169.254/16, 100.64/10, fc00::/7, fe80::/10) and **the internet**.
 
-| หน้าเว็บมาจาก | `lw_fetch` (รูป, CSS, ข้อมูล) | ลิงก์ (`lw_navigate`) | ส่งฟอร์ม POST |
+| The page comes from | `lw_fetch` (pictures, CSS, data) | Links (`lw_navigate`) | POST forms |
 |---|---|---|---|
-| อินเทอร์เน็ต | อินเทอร์เน็ตเท่านั้น | ที่ไหนก็ได้ ยกเว้น `file://` | อินเทอร์เน็ตเท่านั้น |
-| วงแลน | วงแลน + อินเทอร์เน็ต | ที่ไหนก็ได้ ยกเว้น `file://` | วงแลน + อินเทอร์เน็ต |
-| เครื่องนี้ (`localhost`, `lowd`) | ทุกที่ ยกเว้น `file://` | ที่ไหนก็ได้ ยกเว้น `file://` | ทุกที่ |
-| ไฟล์ (`file://`) | ไฟล์ในโฟลเดอร์เดียวกันและโฟลเดอร์ย่อย + ทุก server | ที่ไหนก็ได้ | ทุกที่ |
+| The internet | The internet only | Anywhere but `file://` | The internet only |
+| The local network | Local network + internet | Anywhere but `file://` | Local network + internet |
+| This computer (`localhost`, `lowd`) | Anywhere but `file://` | Anywhere but `file://` | Anywhere |
+| A file (`file://`) | Files in its folder and below + any server | Anywhere | Anywhere |
 
-- ตรวจทุก redirect และทุก connection: redirect ไป 127.0.0.1 หรือ `file://` ก็ถูกกัน, connection ที่ค้างใน pool และของใน
-  HTTP cache จำไว้ว่ามาจากระดับไหน (หน้าเว็บจากอินเทอร์เน็ตจึงอ่านหน้า router ที่เคยเปิดไว้ใน cache ไม่ได้)
-- path ของไฟล์ตรวจหลังแปลงเป็น path เต็มแล้ว (`..`, `%2e%2e`, `%5c` ออกนอกโฟลเดอร์ไม่ได้)
-- ผู้ใช้เองพิมพ์ address ไปที่ไหนก็ได้เหมือนเดิม; ที่ถูกกันจะได้ error ที่ขึ้นต้นด้วย `blocked:` และมีบรรทัด `[net] blocked …` ใน log
-- ยังไม่ใช่ same-origin policy เต็มรูปแบบ: หน้าเว็บยังอ่านข้อมูลสาธารณะจากเว็บอื่นได้ แต่ส่ง cookie ไปให้เว็บอื่นไม่ได้
-  (third-party cookie ถูกปิดอยู่แล้ว) จึงอ่านได้แค่สิ่งที่ใครก็โหลดได้อยู่แล้ว
+- Every redirect and every connection is checked: a redirect to 127.0.0.1 or to `file://` is
+  blocked too, and kept connections and HTTP cache entries remember which level they came from
+  (so a page from the internet can't read a router page that is in the cache).
+- File paths are checked once made absolute (`..`, `%2e%2e`, `%5c` can't leave the folder).
+- The user can still type any address; what is blocked fails with an error starting with
+  `blocked:` and a `[net] blocked …` line in the log.
+- This isn't a full same-origin policy yet: a page can still read public data from other sites,
+  but it can't send their cookies (third-party cookies are off), so it reads only what anyone
+  could download anyway.
 
-address ทำงานเหมือนเว็บปกติ:
-- path ที่ลงท้ายด้วย `/` จะลองโหลด `index.wasm` ในโฟลเดอร์นั้นก่อน ถ้าไม่มี (หรือไม่ใช่ wasm) จะขอ URL เดิมตรง ๆ
-  เว็บทั่วไปจึงได้หน้าแรกปกติของมัน
-- HTML → viewer, `text/plain` → browser แสดงเอง, รูป PNG/JPEG/GIF/BMP → เปิดดูได้ตรง ๆ, `file:///` ใช้ตอนพัฒนา
+Addresses work as on the ordinary web:
+- A path ending in `/` first tries `index.wasm` in that folder; if there is none (or it isn't
+  wasm), the address itself is requested, so ordinary sites get their usual front page.
+- HTML → the viewer, `text/plain` → shown by the browser itself, PNG/JPEG/GIF/BMP pictures → shown
+  as they are; `file:///` is for development.
 
-## HTML viewer ทำอะไรได้บ้าง
+## What the HTML viewer can do
 
-| ส่วน | รองรับ |
+| Part | Supported |
 |---|---|
-| Charset | UTF-8, windows-874/TIS-620 (เว็บไทยรุ่นเก่า รวมถึง google.com), windows-1252/Latin-1 |
-| HTML | tokenizer + tree builder (ปิด tag อัตโนมัติแบบ HTML5 ส่วนใหญ่), character references |
-| Layout | block/inline, ตัดบรรทัด (ไทยตัดตามคำด้วย Uniscribe), หัวข้อ, list, `pre`, ตาราง (colspan, ความกว้างอัตโนมัติ), `bgcolor`/`color`/`align`, inline `style` บางส่วน |
-| แสดงผลทีละส่วน | HTML ถูกส่งให้ viewer **ระหว่างดาวน์โหลด** (gzip ก็ถอดทีละส่วน) และ parse ไปพร้อมกัน; เจอ `<link rel=stylesheet>` ก็โหลด CSS ทันที; จัดหน้าจากบนลงล่างครั้งละ ~12 ms ต่อเฟรม จอแรกขึ้นทันทีที่จัดเสร็จ ส่วนที่ยังดาวน์โหลดไม่ถึงก็รอ แล้วตามมาเองโดยหน้าต่างไม่ค้าง; ตอน resize จะจัดส่วนที่เห็นก่อน; **ตารางที่ยังโหลดไม่จบแสดงแถวที่มาแล้วไปก่อน** (จัดใหม่เมื่อมีแถวเพิ่ม: หน้าที่ทั้งหน้าเป็นตาราง เช่น HN บนเน็ตช้า ขึ้นที่ 1 วินาทีแทนที่จะรอโหลดจบ); หน้าที่ยังไม่เจอ `<main>` รอเพื่อตัดสินใจเรื่อง reader view ไม่เกิน 1 วินาที ถ้า `<main>` มาทีหลังและยังไม่ได้เลื่อนหน้า จะสลับเป็น reader view ให้เอง |
-| CSS | อ่าน `<style>` และ `<link rel=stylesheet>` เพื่อหาว่าอะไรถูก**ซ่อน** (`display:none`, `visibility:hidden`, ข้อความสำหรับ screen reader); `@media` ตามความกว้างจอ; cascade (specificity, `!important`); คำนวณ CSS ของแต่ละ element ตอนที่การจัดหน้าไปถึง และใช้ Bloom filter ของ ancestor ตัด selector ที่ไม่มีทางตรงออกเร็ว ๆ |
-| CSS จัดหน้า | **float** ซ้าย/ขวา (ข้อความไหลรอบ, `clear`, รวมถึง `<img align>`/`<table align>` และ `<br clear>` ของเว็บเก่า; ตารางที่อยู่ข้าง float หลบให้); **flex แถว** (`flex-grow/shrink/basis`, `flex-wrap`, `justify-content`, `align-items`, `gap`; แถวที่แน่นเกินจะขึ้นบรรทัดใหม่แทนการบีบเป็นเส้น); flex คอลัมน์จัดแบบ block; **grid** (`grid-template-columns`: px/fr/%/`repeat()`/`auto-fill`/`minmax()`, `grid-column: span`); `width`, `max-width`, `min-width`, `display: block/inline`; carousel/แถบเลื่อน (`overflow: hidden/auto` รอบแถว flex) แสดงเฉพาะชิ้นที่พอดี; flex/grid/float ที่ยังโหลดไม่จบแสดงไปก่อนแบบเดียวกับตาราง |
-| รูป | PNG, JPEG, GIF, **WebP** (lossy, lossless, alpha, animation เฟรมแรก), **SVG** (ไฟล์ `.svg` และ `<svg>` ที่ฝังในหน้า), BMP; `<picture>`/`srcset`; `data:` URI |
-| Reader view | ถ้าเว็บมี `<main>`/`role=main` จะแสดงแค่ส่วนนั้น คลิกป้ายมุมขวาล่างเพื่อสลับไปดูทั้งหน้า |
-| Form | text/password/checkbox/radio/select/textarea/submit, ส่งแบบ GET และ POST |
-| วิดีโอ, เสียง | `<video>` และ `<audio controls>` (`src` หรือ `<source>`: เลือกชนิดที่ Windows เล่นได้ก่อน, `poster`): กรอบภาพ + แถบปุ่ม (เล่น/หยุด, เวลา, แถบเลื่อนตำแหน่งที่ลากได้, เต็มจอ, ปิดเสียง); **ไม่โหลดอะไรจนกว่าจะกดเล่น** (ไม่มี autoplay); คีย์ Space/K เล่น-หยุด, ←/→ ถอย/ข้าม 5 วินาที, M ปิดเสียง, F หรือดับเบิลคลิกภาพ = เต็มจอ (Esc ออก) |
-| อื่น ๆ | ลิงก์, `#anchor` (รวมถึง URL ที่มี `#` ตั้งแต่เปิด: เลื่อนไปเมื่อจัดหน้าถึง; ภาษาไทยได้ทั้งแบบตัวอักษรตรง ๆ และแบบ `%E0%B8…`), `<meta refresh>`, scroll (ล้อเมาส์, คีย์บอร์ด, scrollbar), ค้นหาในหน้า (`lw_find`) |
+| Charsets | UTF-8, windows-874/TIS-620 (older Thai sites, google.com included), windows-1252/Latin-1 |
+| HTML | Tokenizer + tree builder (most of HTML5's implied end tags), character references |
+| Layout | Block/inline, line breaking (Thai by words, through Uniscribe), headings, lists, `pre`, tables (colspan, automatic widths), `bgcolor`/`color`/`align`, part of inline `style` |
+| Showing pages as they load | The HTML reaches the viewer **while it downloads** (gzip is decoded piece by piece too) and is parsed as it comes; a `<link rel=stylesheet>` is fetched as soon as it is seen; the layout goes top to bottom ~12 ms per frame, the first screen shows as soon as it is laid out, and what hasn't arrived yet follows by itself without freezing the window; on resize, what is in view is laid out first; **a table still loading shows the rows it has** (laid out again as rows come: a page that is one big table, like HN on a slow connection, shows at 1 second instead of at the end); a page with no `<main>` yet waits at most 1 second to decide on reader view, and if `<main>` comes later and the user hasn't scrolled, it switches to reader view by itself |
+| CSS | Reads `<style>` and `<link rel=stylesheet>` to find what is **hidden** (`display:none`, `visibility:hidden`, text for screen readers); `@media` by window width; the cascade (specificity, `!important`); each element's CSS is worked out when the layout reaches it, with a Bloom filter of its ancestors to drop selectors that can't match early |
+| CSS layout | **Floats** left/right (text flows around them, `clear`, also `<img align>`/`<table align>` and `<br clear>` of older sites; tables beside a float make room); **flex rows** (`flex-grow/shrink/basis`, `flex-wrap`, `justify-content`, `align-items`, `gap`; a row too crowded wraps instead of squeezing its items into slivers); flex columns are laid out as blocks; **grid** (`grid-template-columns`: px/fr/%/`repeat()`/`auto-fill`/`minmax()`, `grid-column: span`); `width`, `max-width`, `min-width`, `display: block/inline`; carousels/strips (`overflow: hidden/auto` around a flex row) show only the items that fit; flex/grid/floats still loading are shown as they are, like tables |
+| Pictures | PNG, JPEG, GIF, **WebP** (lossy, lossless, alpha, the first frame of animations), **SVG** (`.svg` files and `<svg>` in the page), BMP; `<picture>`/`srcset`; `data:` URIs |
+| Reader view | If the site has `<main>`/`role=main`, only that is shown; the badge at the bottom right switches to the full page |
+| Forms | text/password/checkbox/radio/select/textarea/submit, sent with GET and POST |
+| Video, audio | `<video>` and `<audio controls>` (`src` or `<source>`: the kinds Windows plays come first; `poster`): the picture + a bar of controls (play/pause, time, a seek track that can be dragged, fullscreen, mute); **nothing is downloaded until play is clicked** (no autoplay); keys: Space/K play/pause, ←/→ 5 seconds back/on, M mute, F or a double-click on the picture = fullscreen (Esc to leave) |
+| Other | Links, `#anchor`s (also in the address the page is opened with: it scrolls there when the layout gets there; Thai both as characters and as `%E0%B8…`), `<meta refresh>`, scrolling (wheel, keyboard, scrollbar), find in page (`lw_find`) |
 
-ไม่มี: JavaScript (จึงเล่นวิดีโอของ YouTube, Facebook, TikTok, Netflix ไม่ได้: เว็บพวกนี้ใช้ JS ดึงวิดีโอเป็นท่อน ๆ และบางเว็บมี DRM; HLS/DASH ก็ยังไม่มี), CSS `position` (absolute/fixed/sticky วางตามลำดับปกติ), margin/padding/สีพื้นจาก stylesheet (ใช้ได้เฉพาะใน `style=""`), inline-block จริง, AVIF
-(เว็บที่ต้องใช้ JS อย่างผลค้นหาของ Google จึงใช้ไม่ได้ ส่วน DuckDuckGo Lite, Wikipedia, Hacker News, BBC ใช้ได้)
+Not supported: JavaScript (so videos on YouTube, Facebook, TikTok and Netflix don't play: those
+sites fetch video in pieces with JS, and some use DRM; HLS/DASH aren't there yet either), CSS
+`position` (absolute/fixed/sticky are laid out in normal flow), margin/padding/background colours
+from stylesheets (only in `style=""`), real inline-block, AVIF.
+(So sites that need JS, like Google's search results, don't work; DuckDuckGo Lite, Wikipedia,
+Hacker News and BBC do.)
 
-## เขียนเว็บของตัวเอง
+## Write your own page
 
 ```c
 #include "lowweb.h"
@@ -190,7 +229,7 @@ LW_EXPORT(lw_start) void lw_start(void) { lw_set_title(LW_STR("Hello")); }
 
 LW_EXPORT(lw_frame) void lw_frame(double ms) {
     for (int i = 0; i < 640 * 360; i++) fb[i] = 0xFF3B2A1E;          // 0xAABBGGRR
-    lw_text(fb, 640, 360, 40, 40, LW_STR("สวัสดี Low-web!"), 40, LW_TEXT_BOLD, 0xFFFFFFFF);
+    lw_text(fb, 640, 360, 40, 40, LW_STR("Hello, Low-web! สวัสดี"), 40, LW_TEXT_BOLD, 0xFFFFFFFF);
     lw_present(fb, 640, 360);
 }
 ```
@@ -200,73 +239,81 @@ clang --target=wasm32 -O2 -mcpu=mvp -mbulk-memory -mnontrapping-fptoint -msign-e
       -mmutable-globals -nostdlib -fno-builtin -Wl,--no-entry -Isdk -o index.wasm hello.c
 ```
 
-ฟังก์ชันทั้งหมดอยู่ใน [`sdk/lowweb.h`](sdk/lowweb.h) สรุปสั้น ๆ:
+Every function is in [`sdk/lowweb.h`](sdk/lowweb.h). In short:
 
-| หน้าเว็บ export (browser เรียก) | browser ให้ (หน้าเว็บเรียก) |
+| The page exports (the browser calls) | The browser provides (the page calls) |
 |---|---|
-| `lw_start`, `lw_resize`, `lw_frame` | `lw_present` ส่งภาพขึ้นจอ |
-| `lw_pointer` (เมาส์ → คืน cursor) | `lw_text`, `lw_text_width` (ตัวหนา/เอียง/monospace), `lw_line_breaks` |
-| `lw_key`, `lw_char` | `lw_fetch` → ผลกลับมาทาง `lw_on_fetch` / `lw_on_fetch_ex` |
-| `lw_alloc` (ให้ browser ขอหน่วยความจำ) | `lw_open_file` → `lw_on_file`, `lw_save_file`, `lw_clipboard_set/get` |
-| `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (เอกสารแบบ stream), `lw_state`/`lw_restore` (ตำแหน่งที่อ่านอยู่), `lw_find` (ค้นหาในหน้า) (สามตัวหลังไม่บังคับ) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
-| | `lw_video_open/play/pause/seek/volume/info/error/close`: วิดีโอและเสียง; หน้าเว็บบอกตำแหน่งด้วย `lw_video_place` ทุกครั้งที่ `lw_present` แล้ว browser วาดภาพลงไปเอง (ไม่ผ่าน interpreter ทีละเฟรม); เริ่มมีเสียงได้เฉพาะตอนผู้ใช้คลิก/กดคีย์ (นอกนั้นเล่นแบบปิดเสียง) |
-| | `lw_fullscreen` เต็มจอ (เฉพาะตอนผู้ใช้คลิก/กดคีย์; ผู้ใช้ออกได้ด้วย Esc/F11) |
+| `lw_start`, `lw_resize`, `lw_frame` | `lw_present` puts a frame on the screen |
+| `lw_pointer` (the mouse → returns a cursor) | `lw_text`, `lw_text_width` (bold/italic/monospace), `lw_line_breaks` |
+| `lw_key`, `lw_char` | `lw_fetch` → the answer comes through `lw_on_fetch` / `lw_on_fetch_ex` |
+| `lw_alloc` (for the browser to get memory in the page) | `lw_open_file` → `lw_on_file`, `lw_save_file`, `lw_clipboard_set/get` |
+| `lw_on_file`, `lw_on_fetch`, `lw_on_fetch_ex`, `lw_on_fetch_begin/data/end` (a streamed document), `lw_state`/`lw_restore` (where the reader is), `lw_find` (find in page) (the last three are optional) | `lw_image_decode/read/free`, `lw_navigate`, `lw_navigate_post`, `lw_open_tab`, `lw_mods`, `lw_set_title`, `lw_now`, `lw_scale`, `lw_log` |
+| | `lw_video_open/play/pause/seek/volume/info/error/close`: video and audio; the page says where each goes with `lw_video_place` at every `lw_present` and the browser draws the pictures there itself (not through the interpreter, frame by frame); sound can start only while the user clicks or presses a key (otherwise it plays muted) |
+| | `lw_fullscreen` (only while the user clicks or presses a key; the user can leave with Esc/F11) |
 
-## Host จริง
+## Hosting
 
-เว็บ Low-web เป็นแค่ไฟล์ static (`.wasm`, `.txt`, รูป) จึง host ได้ 3 แบบ
+A Low-web site is only static files (`.wasm`, `.txt`, pictures), so there are 3 ways to host one:
 
-1. **`lowd` บน VPS / Linux**: `g++ -std=c++17 -O2 -pthread -o lowd server/lowd.cpp` แล้ว
-   `./lowd -p 80 www` (หรือพอร์ตอื่น + reverse proxy) ผู้ใช้เปิด `http://ชื่อโดเมน/`
-2. **เครื่องตัวเอง**: `bin\lowd.exe sites\www` (ฟังทุก interface, IPv4+IPv6), อนุญาตใน Windows Firewall,
-   แล้ว port-forward 8080 ที่ router หรือใช้ tunnel อย่าง Cloudflare Tunnel ถ้าไม่มี public IP
-3. **static host ที่มี HTTPS** (GitHub Pages, Cloudflare Pages, Netlify …): อัปโหลดโฟลเดอร์ `www`
-   ได้เลย browser รองรับ HTTPS และ redirect เอง ขอแค่ให้มีไฟล์ `index.wasm` ในแต่ละโฟลเดอร์
+1. **`lowd` on a VPS / Linux**: `g++ -std=c++17 -O2 -pthread -o lowd server/lowd.cpp`, then
+   `./lowd -p 80 www` (or another port behind a reverse proxy); users open `http://your-domain/`.
+2. **Your own computer**: `bin\lowd.exe sites\www` (listens on every interface, IPv4 + IPv6), allow
+   it in Windows Firewall, then forward port 8080 on the router, or use a tunnel such as
+   Cloudflare Tunnel if there is no public IP.
+3. **A static host with HTTPS** (GitHub Pages, Cloudflare Pages, Netlify …): upload the `www`
+   folder as it is; the browser handles HTTPS and redirects itself, it only needs an `index.wasm`
+   in each folder.
 
-## การทดสอบ
+## Testing
 
-ทุก push และ pull request บน GitHub ถูก build และทดสอบอัตโนมัติ (`.github/workflows/ci.yml`): `build.cmd` + `tests/run_tests.py`
-+ `tests/check_lowd.sh` บน Windows, และ build `lowd` + `check_lowd.sh` บน Ubuntu; ได้ `lowweb.exe` กับ `lowd.exe` เป็น artifact
-ให้ดาวน์โหลด (เก็บ 14 วัน) และ warning ของ compiler จะขึ้นเป็น annotation
+Every push and pull request on GitHub is built and tested (`.github/workflows/ci.yml`): `build.cmd`
++ `tests/run_tests.py` + `tests/check_lowd.sh` on Windows, and `lowd` + `check_lowd.sh` on Ubuntu;
+`lowweb.exe` and `lowd.exe` can be downloaded as artifacts (kept 14 days), and compiler warnings
+show as annotations.
 
-| คำสั่ง | ทดสอบอะไร |
+| Command | What it tests |
 |---|---|
-| `python tests/run_tests.py [ชื่อ…]` | **รันทุกชุดที่ไม่ต้องใช้เน็ต** ในคำสั่งเดียว (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css, video, history, referer) ตามที่ CI รัน: ควรรันก่อน commit |
-| `python tests/check_referer.py` | header ที่ browser ส่ง (server ทดสอบ 2 port = 2 origin): User-Agent แบบ Chrome + `Low-web/0.1`, Referer แบบค่าตั้งต้นของ browser (`strict-origin-when-cross-origin`): origin เดียวกันได้ที่อยู่เต็ม (ไม่มี #fragment), ต่าง origin ได้แค่ origin, ที่อยู่ที่พิมพ์เองไม่มี Referer |
-| `python tests/check_history.py` | ประวัติ back/forward: ลิงก์ที่ผู้ใช้คลิกเพิ่มรายการ แต่หน้าที่พาไปต่อเอง (`<meta refresh>` แบบหน้า redirect ของ search engine) แทนที่รายการของตัวเอง กด Back จึงกลับไปหน้าค้นหาได้ ไม่วนกลับมาหน้าเดิม |
-| `python tests/check_video.py` | วิดีโอ (`tests/samples/colors.mp4`: แดง เขียว น้ำเงิน เหลือง อย่างละวินาที จึงดูจากภาพได้ว่าอยู่วินาทีไหน): คลิกเล่น, Space หยุด, คลิกแถบเลื่อนไป 85%, เล่นจนจบ, F เต็มจอ / Esc ออก, `<audio>`, ไฟล์ที่ไม่มีบอกเหตุผลบนภาพ, และผ่าน HTTP ช้า ๆ (`slow_server.py`) ที่ข้อมูลภาพอยู่ห่างจากต้นไฟล์ 3 MB ต้องขอเป็น range; SKIP ถ้า Windows ไม่มี Media Foundation หรือเครื่องไม่มีอุปกรณ์เสียง |
-| `python tests/check_css_layout.py` | CSS จัดหน้าจาก stylesheet: หน้ากล่องสี (flex แถว 1:2 + กว้างคงที่ + gap, float ขวา + ข้อความไหลรอบ + clear, grid 3 คอลัมน์, carousel ใน `overflow:hidden`, `justify-content:center`) แล้วหากล่องจากสีในภาพ |
-| `python tests/check_progressive.py` | หน้าที่โหลดช้า (`slow_server.py` บน port ว่าง): ตารางใหญ่แสดงแถวก่อนโหลดจบ, หน้าไม่มี `<main>` ขึ้นจอแรกก่อนโหลดจบ, `<main>` ที่มาช้ายังจบที่ reader view, และภาพสุดท้ายเหมือนโหลดทีเดียว |
-| `python tests/check_edit.py` | ช่องกรอก (พิมพ์, ลูกศร, Home/End, Shift เลือก, Delete/Backspace, ตัด, สระไทย, ดับเบิลคลิก, ลากเลือก, Tab, textarea), `#fragment` ภาษาไทยแบบตรงและแบบ `%`, ค้นหาในหน้า (นับ, ถัดไป/ก่อนหน้า, ตัวพิมพ์, ไม่เจอ, ไฟล์ข้อความ) |
-| `python tests/check_select.py` | เลือก/คัดลอก/วางข้อความ: ทั้งหน้า, ลากเลือก (ข้ามลิงก์), ช่องกรอก (วาง, ตัด, รหัสผ่านคัดลอกไม่ได้), ไฟล์ข้อความ, หน้า error; แถบแท็บ: ส่วนไหนเป็น caption/ปุ่ม/ขอบปรับขนาด, ปุ่มขยายหน้าต่าง |
-| `python tests/check_sleep.py` | แท็บหลับแล้วตื่นมาเหมือนเดิมทุก pixel ที่ตำแหน่งเดิม, back และ reload กลับที่เดิม, หน้าที่พิมพ์ไว้และหน้า Low-web ไม่หลับ |
-| `python tests/check_access.py` | หน้าเว็บเข้าถึงอะไรได้: ระดับของ IP, หน้าเว็บจากอินเทอร์เน็ต/วงแลนเข้า 127.0.0.1, `localhost`, `[::1]` ไม่ได้, redirect ไป `file://`, ของใน cache, ไฟล์นอกโฟลเดอร์ (`..`, `%2e%2e`, `%5c`) |
-| `bash tests/check_lowd.sh [LOWD]` | `lowd`: ส่ง `index.wasm`, redirect โฟลเดอร์, 404, กัน `..`/`%2e%2e`, ปฏิเสธ POST, HEAD |
-| `node tests/check_ops.mjs` เทียบกับ `bin\wasmrun build\ops.wasm "int32()" "int64()" "floats()" "control()" "memory_ops()"` | interpreter ให้ผลตรงกับ V8 ทุกบิต (integer, float, control flow, memory, traps); `wasmrun --no-fuse` รันแบบไม่รวมคำสั่ง ต้องได้ผลเท่ากัน |
-| `python tests/check_images.py` | decoder ตรงกับ PIL (PNG ทุกชนิด, JPEG baseline/progressive/subsampling/restart/EXIF, GIF, BMP) และ **WebP ตรงกับ libwebp ทุก pixel** |
-| `python tests/check_cookies.py` | cookie: กฎทั้งหมดของ jar (`bin\cookietest`: domain, path, Secure, อายุ, SameSite, third-party, prefix, การบันทึกไฟล์) และผ่าน HTTP จริง: cookie จาก redirect ไปถึงหน้าถัดไป, cache ที่ `Vary: Cookie` ไม่ถูกใช้ซ้ำเมื่อ cookie เปลี่ยน |
-| `python tests/check_hpack.py` | HPACK ของ HTTP/2 ตรงกับตัวอย่างทุกข้อใน RFC 7541 Appendix C (มี/ไม่มี Huffman, dynamic table เต็มและไล่ออก), static table ตาม Appendix A, encode แล้ว decode กลับได้เหมือนเดิม |
-| `bin\fetchtest --parallel [--no-h2] URL…` | ดึงหลาย URL พร้อมกัน: HTTP/2 ใช้ connection เดียว; `--save DIR` เก็บ body ไว้เทียบกับ HTTP/1.1 |
-| `python tests/bench_viewer.py` | จับเวลา viewer กับหน้า Wikipedia 3 MB โดยไม่เปิดหน้าต่าง (`bin\viewerbench`) ทั้งแบบมีและไม่มี instruction fusion และตรวจว่าวาดภาพสุดท้ายได้เหมือนกันทุก pixel; `viewerbench --stream N` ส่ง HTML ทีละ N ไบต์เหมือนตอนดาวน์โหลด และพิมพ์ขนาด wasm memory |
-| `python tests/check_cache.py` | HTTP cache และ keep-alive กับ server ทดสอบในเครื่อง: `max-age`, `Expires`, `ETag`/`If-None-Match`, `Last-Modified`, `no-store`, redirect ที่ cache ไว้, reload/hard reload, หลาย request บน connection เดียว (รวม chunked), `Connection: close`, connection ที่ server ปิดทิ้งแล้วต้องส่งใหม่ |
-| `python tests/check_stream.py` | ถอด gzip/zlib/deflate แบบทีละส่วน (ที่ใช้แสดงหน้าระหว่างดาวน์โหลด) จากชิ้นขนาดสุ่ม ต้องได้ไบต์ตรงกับต้นฉบับ |
-| `bin\fetchtest --stream URL…` | รับ body ทีละส่วนจาก network จริง และตรวจว่าตรงกับ body ทั้งก้อน |
-| `python tests/check_svg.py` | SVG เทียบกับ Microsoft Edge (headless) แบบวางคู่กัน ภาพอยู่ใน `build/svgtest/*.cmp.png` |
-| `python tests/gen_hpack_huffman.py` | สร้าง `browser/hpack_huffman.h` (ตาราง Huffman ของ HPACK จาก RFC 7541) |
-| `python tests/gen_webp_tables.py` | สร้าง `browser/webp_tables.h` (ตารางค่าคงที่ของ VP8/VP8L จาก spec) |
-| `bin\fetchtest [--exact] [--cache DIR] URL…` | HTTP/HTTPS, redirect, chunked, gzip, ตรวจ certificate, กฎ `index.wasm`; log บอกว่าแต่ละ request มาจาก cache หรือใช้ connection เดิม |
-| `bin\lowweb.exe URL --size 1000x680 --log out.log --script "wait 500; click 100 200; key 83 ctrl" --screenshot out.bmp` | ขับ browser อัตโนมัติแล้วถ่ายภาพหน้าจอ (log บอกเวลานับจากเริ่มโหลด เช่น `[page +383 ms] viewer: first screen…`; คำสั่งรอจะรอให้โหลดเสร็จก่อน ยกเว้นสั่ง `async` (กลับมารอด้วย `sync`); `mem` เขียนการใช้หน่วยความจำลง log; `clip TEXT` ใส่ข้อความใน clipboard ของ script (script mode ไม่แตะ clipboard จริง: ทุกการคัดลอกเขียนเป็น `[clipboard] …` ใน log); `hittest X Y` บอกว่าจุดนั้นบนแถบแท็บเป็นอะไร; `chars TEXT` พิมพ์ข้อความลงหน้า; `find TEXT` / `findnext` / `findprev` / `findclose` ใช้แถบค้นหา (log `[find] 3/12`)) |
+| `python tests/run_tests.py [NAME…]` | **Every test that needs no internet**, in one command (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css, video, history, referer), as CI runs them: run it before committing |
+| `python tests/check_referer.py` | The headers the browser sends (a test server on 2 ports = 2 origins): a Chrome-style User-Agent + `Low-web/0.1`; Referer as browsers send it by default (`strict-origin-when-cross-origin`): the whole address (no #fragment) to the same origin, only the origin to another one, none for a typed address |
+| `python tests/check_history.py` | Back/forward: a link the user clicks adds an entry, but a page that moves on by itself (a `<meta refresh>` like a search engine's redirect page) takes its own place, so Back goes back to the search instead of round to the same page |
+| `python tests/check_video.py` | Video (`tests/samples/colors.mp4`: one second each of red, green, blue and yellow, so a screenshot tells where it is): click to play, Space to pause, a click on the track at 85%, playing to the end, F for fullscreen / Esc, `<audio>`, a missing file says why on its picture, and over slow HTTP (`slow_server.py`) with the picture data 3 MB into the file, which needs a range request; SKIP where Windows has no Media Foundation or the computer no sound device |
+| `python tests/check_css_layout.py` | CSS layout from stylesheets: a page of coloured boxes (a flex row 1:2 + a fixed width + gap, a right float with text around it + clear, a 3-column grid, a carousel in `overflow:hidden`, `justify-content:center`), each box found by its colour in a screenshot |
+| `python tests/check_progressive.py` | Pages loading slowly (`slow_server.py` on a free port): a big table shows rows before the download ends, a page without `<main>` shows its first screen before the end, a `<main>` that comes late still ends in reader view, and the final picture is the same as when loaded at once |
+| `python tests/check_edit.py` | Text fields (typing, arrows, Home/End, Shift to select, Delete/Backspace, cutting, Thai vowels, double-click, drag to select, Tab, textarea), Thai `#fragment`s as characters and as `%`, find in page (count, next/previous, case, not found, text files) |
+| `python tests/check_select.py` | Selecting/copying/pasting text: the whole page, a drag (across a link), text fields (paste, cut, password fields can't be copied), text files, error pages; the tab strip: which parts are caption/buttons/resize edge, the maximize button |
+| `python tests/check_sleep.py` | A tab that went to sleep wakes up the same to the pixel at the same place, back and reload return to the same place, pages typed into and Low-web pages don't sleep |
+| `python tests/check_access.py` | What pages can reach: IP levels, pages from the internet/local network can't reach 127.0.0.1, `localhost`, `[::1]`, redirects to `file://`, cache entries, files outside the folder (`..`, `%2e%2e`, `%5c`) |
+| `bash tests/check_lowd.sh [LOWD]` | `lowd`: serves `index.wasm`, redirects folders, 404, blocks `..`/`%2e%2e`, refuses POST, HEAD |
+| `node tests/check_ops.mjs` against `bin\wasmrun build\ops.wasm "int32()" "int64()" "floats()" "control()" "memory_ops()"` | The interpreter gives the same results as V8 to the bit (integers, floats, control flow, memory, traps); `wasmrun --no-fuse` runs without fused instructions and must give the same |
+| `python tests/check_images.py` | The decoders match PIL (every kind of PNG, JPEG baseline/progressive/subsampling/restart/EXIF, GIF, BMP) and **WebP matches libwebp to the pixel** |
+| `python tests/check_cookies.py` | Cookies: every rule of the jar (`bin\cookietest`: domain, path, Secure, lifetime, SameSite, third-party, prefixes, saving to the file) and over real HTTP: cookies from a redirect reach the next page, a cached `Vary: Cookie` answer isn't reused when the cookies change |
+| `python tests/check_hpack.py` | HTTP/2's HPACK matches every example in RFC 7541 Appendix C (with/without Huffman, a full dynamic table and evictions), the static table of Appendix A, and encoding then decoding gives the same back |
+| `bin\fetchtest --parallel [--no-h2] URL…` | Fetches many URLs at once: HTTP/2 uses one connection; `--save DIR` keeps the bodies to compare with HTTP/1.1 |
+| `python tests/bench_viewer.py` | Times the viewer on a 3 MB Wikipedia page without a window (`bin\viewerbench`), with and without instruction fusion, and checks that both draw the same final picture to the pixel; `viewerbench --stream N` hands the HTML over N bytes at a time as a download does, and prints the size of wasm memory |
+| `python tests/check_cache.py` | HTTP cache and keep-alive with a local test server: `max-age`, `Expires`, `ETag`/`If-None-Match`, `Last-Modified`, `no-store`, cached redirects, reload/hard reload, many requests on one connection (chunked too), `Connection: close`, a connection the server closed that needs the request sent again |
+| `python tests/check_stream.py` | gzip/zlib/deflate decoded piece by piece (as for showing pages while they download), from pieces of random size, must give the original bytes |
+| `bin\fetchtest --stream URL…` | Receives bodies piece by piece from the real network and checks they match the whole body |
+| `python tests/check_svg.py` | SVG next to Microsoft Edge (headless), side by side, in `build/svgtest/*.cmp.png` |
+| `python tests/gen_samples.py` | Makes the sample pictures `tests/samples/gen_*` |
+| `python tests/gen_hpack_huffman.py` | Makes `browser/hpack_huffman.h` (HPACK's Huffman table, from RFC 7541) |
+| `python tests/gen_webp_tables.py` | Makes `browser/webp_tables.h` (the constant tables of VP8/VP8L, from the spec) |
+| `bin\fetchtest [--exact] [--cache DIR] URL…` | HTTP/HTTPS, redirects, chunked, gzip, certificate checks, the `index.wasm` rule; the log says whether each request came from the cache or a kept connection |
+| `bin\lowweb.exe URL --size 1000x680 --log out.log --script "wait 500; click 100 200; key 83 ctrl" --screenshot out.bmp` | Drives the browser and takes a screenshot (the log gives times from the start of the load, e.g. `[page +383 ms] viewer: first screen…`; waiting commands wait for the load to finish unless `async` was given (back with `sync`); `mem` writes memory use to the log; `clip TEXT` puts text on the script's clipboard (script mode doesn't touch the real clipboard: every copy is logged as `[clipboard] …`); `hittest X Y` says what that point of the tab strip is; `chars TEXT` types into the page; `find TEXT` / `findnext` / `findprev` / `findclose` use the find bar (logged as `[find] 3/12`); `video` logs what the page's videos are doing; `history` logs the tab's history) |
 
-## ข้อจำกัดที่รู้อยู่
+## Known limitations
 
-- browser รันบน Windows (Win32 + SChannel); `lowd` build และทดสอบบน Linux ใน CI
-- หน้าเว็บรันบน UI thread ด้วย interpreter (รวมคำสั่งที่เจอบ่อยเป็นคำสั่งเดียวตอนโหลด + threaded dispatch: เร็วขึ้น ~2 เท่า
-  เทียบกับแบบเดิม; ยังไม่มี JIT): งานหนัก ๆ (เช่นเทสีทั้งผืนใน Paint) ใช้เวลา ~0.1 วินาที,
-  หน้า Wikipedia ขนาด 3 MB: parse ~0.12 วินาที, จัดหน้าครั้งแรก ~0.29 วินาที (จัดใหม่ตอนรูปมา ~0.08 วินาที),
-  จอแรกขึ้นประมาณ 0.4 วินาทีหลังกด Enter ครั้งแรก และ ~0.2 วินาทีเมื่อ CSS อยู่ใน cache แล้ว; หน้า Low-web ที่ค้างเกิน 5 วินาที (viewer: 20 วินาที) จะถูกหยุด
-- ยังไม่มี TLS 1.3 (SChannel ของ Windows 10 ยังไม่เปิด TLS 1.3 ให้ฝั่ง client จึงใช้ TLS 1.2)
-- วิดีโอเล่นด้วย Media Foundation ของ Windows: Windows รุ่น N ต้องลง Media Feature Pack, เครื่องที่ไม่มีอุปกรณ์เสียงเล่นไม่ได้
-  (Media Foundation ต้องมี), ไฟล์ MP4 ที่มี B-frame ภาพจะช้ากว่าเสียงไม่กี่เฟรม (Media Foundation ไม่สน edit list);
-  CPU ขณะเล่น: H.264 640×360 ~5% ของหนึ่ง core, MPEG-4 Part 2 ของ Wikipedia ~14% (ถอดรหัสด้วย CPU)
-- กันหน้าเว็บจากอินเทอร์เน็ตไม่ให้เข้าเครื่องนี้/วงแลน/ไฟล์ได้แล้ว (ดู "หน้าเว็บเข้าถึงอะไรได้บ้าง") แต่ยังไม่มี same-origin policy
-  เต็มรูปแบบ
+- The browser runs on Windows (Win32 + SChannel); `lowd` is also built and tested on Linux in CI.
+- Pages run on the UI thread in an interpreter (frequent instruction sequences are fused when a
+  module loads, plus threaded dispatch: ~2× faster than before; no JIT yet). Heavy work (such as a
+  flood fill of the whole canvas in Paint) takes ~0.1 s; a 3 MB Wikipedia page: parsing ~0.12 s,
+  first layout ~0.29 s (again when pictures arrive ~0.08 s), first screen ~0.4 s after the first
+  Enter and ~0.2 s with the CSS in the cache. A Low-web page stuck for more than 5 seconds (the
+  viewer: 20 seconds) is stopped.
+- No TLS 1.3 yet (Windows 10's SChannel doesn't offer TLS 1.3 to clients, so TLS 1.2 is used).
+- Video plays through Windows' Media Foundation: Windows "N" editions need the Media Feature Pack,
+  computers without a sound device can't play (Media Foundation needs one), and MP4 files with
+  B-frames show the picture a few frames behind the sound (Media Foundation ignores edit lists).
+  CPU while playing: H.264 640×360 ~5% of one core, Wikipedia's MPEG-4 Part 2 ~14% (decoded on
+  the CPU).
+- Pages from the internet are kept away from this computer, the local network and files (see
+  "What a page can reach"), but there is no full same-origin policy yet.

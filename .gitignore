@@ -1,5 +1,6 @@
-# Notes for whoever continues the work (local only)
+# Notes for whoever continues the work, and the Thai README (local only)
 /HANDOFF.md
+/README.th.md
 
 # What build.cmd and the tests make; all of it can be made again.
 /bin/
