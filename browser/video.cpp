@@ -513,13 +513,15 @@ private:
     std::shared_ptr<Events> e_;
 };
 
-// A name for the media engine to tell the kind of file by (it goes by the extension).
+// A name for the media engine to tell the kind of file by (it goes by the extension). Every
+// MP4 (.m4a audio, .m4v) is called .mp4: the same reader takes them all, and some Windows
+// (Server) have it registered only for .mp4.
 std::string name_for(const std::string &type, const std::string &url) {
     std::string t;
     for (char c : type.substr(0, type.find(';'))) t += (char)tolower((unsigned char)c);
     while (!t.empty() && t.back() == ' ') t.pop_back();
     static const char *const known[][2] = {
-        {"video/mp4", "mp4"}, {"audio/mp4", "m4a"}, {"audio/x-m4a", "m4a"}, {"video/quicktime", "mov"}, {"video/webm", "webm"},
+        {"video/mp4", "mp4"}, {"audio/mp4", "mp4"}, {"audio/x-m4a", "mp4"}, {"video/x-m4v", "mp4"}, {"video/quicktime", "mov"}, {"video/webm", "webm"},
         {"audio/webm", "webm"}, {"audio/mpeg", "mp3"}, {"audio/mp3", "mp3"}, {"audio/wav", "wav"}, {"audio/x-wav", "wav"},
         {"audio/wave", "wav"}, {"audio/aac", "aac"}, {"video/x-msvideo", "avi"}, {"video/3gpp", "3gp"}, {"video/mp2t", "ts"},
         {"audio/ogg", "ogg"}, {"video/ogg", "ogv"}, {"audio/flac", "flac"}, {"video/x-ms-wmv", "wmv"}, {"audio/x-ms-wma", "wma"}};
@@ -527,8 +529,11 @@ std::string name_for(const std::string &type, const std::string &url) {
         if (t == k[0]) return std::string("media.") + k[1];
     std::string path = url.substr(0, url.find_first_of("?#"));  // else the address's own extension
     size_t dot = path.rfind('.'), slash = path.rfind('/');
-    if (dot != std::string::npos && (slash == std::string::npos || dot > slash) && path.size() - dot <= 5)
-        return "media" + path.substr(dot);
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash) && path.size() - dot <= 5) {
+        std::string ext = path.substr(dot);
+        for (char &c : ext) c = (char)tolower((unsigned char)c);
+        return ext == ".m4a" || ext == ".m4v" ? "media.mp4" : "media" + ext;
+    }
     return "media.mp4";
 }
 
