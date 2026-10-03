@@ -14,10 +14,10 @@ BAR = (28, 28, 31)  # the controls' bar
 COLORS = {'red': (255, 0, 0), 'green': (0, 255, 0), 'blue': (0, 0, 255), 'yellow': (255, 255, 0)}
 ORDER = ['red', 'green', 'blue', 'yellow']
 work = tempfile.mkdtemp(prefix='lw-video-')
-for f in ('colors.mp4', 'tone.mp3'):
+for f in ('colors.mp4', 'tone.m4a'):  # (AAC: Windows Server, as on CI, has no MP3 decoder)
     shutil.copy(os.path.join(ROOT, 'tests', 'samples', f), work)
 PAGE = ('<!doctype html><html><head><meta charset="utf-8"><title>video</title></head><body>\n<p>Before the video.</p>\n'
-        '<video controls width="320" height="180" src="%s"></video>\n<p>Between.</p>\n<div><audio controls src="tone.mp3"></audio></div>\n'
+        '<video controls width="320" height="180" src="%s"></video>\n<p>Between.</p>\n<div><audio controls src="tone.m4a"></audio></div>\n'
         '<div><video controls width="320" height="180" src="missing.mp4"></video></div>\n</body></html>')
 with open(os.path.join(work, 'page.html'), 'w', encoding='utf-8') as f:
     f.write(PAGE % 'colors.mp4')

@@ -312,7 +312,8 @@ show as annotations.
 - No TLS 1.3 yet (Windows 10's SChannel doesn't offer TLS 1.3 to clients, so TLS 1.2 is used).
 - Video plays through Windows' Media Foundation: Windows "N" editions need the Media Feature Pack,
   computers without a sound device can't play (Media Foundation needs one), and MP4 files with
-  B-frames show the picture a few frames behind the sound (Media Foundation ignores edit lists).
+  B-frames show the picture a few frames behind the sound (Media Foundation ignores edit lists),
+  and Windows Server has no MP3 decoder (MP4/H.264/AAC plays there).
   CPU while playing: H.264 640×360 ~5% of one core, Wikipedia's MPEG-4 Part 2 ~14% (decoded on
   the CPU).
 - Pages from the internet are kept away from this computer, the local network and files (see
