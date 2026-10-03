@@ -4411,6 +4411,7 @@ static void videos_tick(void) {
             int n = lw_video_error(v->handle, e, (int)sizeof e);
             v->error = arena_str(e, MAX(0, MIN(n, (int)sizeof e)));
         }
+        if (st != v->state && v->visible) dirty = 1;  // the picture's part changes too (the play button, an error)
         v->state = st;
         if (video_drag != i) v->t = inf[0];
         v->dur = inf[1];
