@@ -77,11 +77,11 @@ tests = {
 </svg>''',
 }
 
-# a few real-world SVGs (tests/samples)
+# a few SVGs as tools write them (tests/samples: real_* from the web, gen_* from tests/gen_samples.py)
 import shutil
 real = []
 for f in sorted(os.listdir('tests/samples')):
-    if f.startswith('real_') and f.endswith('.svg'):
+    if f.startswith(('real_', 'gen_')) and f.endswith('.svg'):
         shutil.copy(f'tests/samples/{f}', f'{out}/{f}')
         real.append(f)
 

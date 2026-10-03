@@ -40,7 +40,7 @@
 | `sites/home/`, `sites/paint/` | source ของหน้าเว็บตัวอย่าง |
 | `sites/viewer/` | **HTML viewer**: `viewer.c` (HTML → layout → วาด) และ `css.c` (CSS เท่าที่จำเป็น) |
 | `sites/www/` | **web root** ที่ host จริง (`index.wasm`, `paint/index.wasm`, `motd.txt`, `about.txt`) |
-| `tests/` | ชุดทดสอบ interpreter / decoder / network / cache, ไฟล์ตัวอย่างจากเว็บจริง (`tests/samples/`) และสคริปต์ช่วยพัฒนา (`dev.sh`, `shot.sh`, `slow_server.py`) |
+| `tests/` | ชุดทดสอบ interpreter / decoder / network / cache, ไฟล์ตัวอย่าง (`tests/samples/`: `gen_*` สร้างด้วย `tests/gen_samples.py` จากภาพที่วาดเองแต่เขียนด้วย encoder จริง ให้มีลักษณะแบบไฟล์บนเว็บ; `real_w3c.svg` (CC-BY, เครดิตอยู่ในไฟล์), ธงชาติไทย, RFC 7541) และสคริปต์ช่วยพัฒนา (`dev.sh`, `shot.sh`, `slow_server.py`) |
 | `build/` | ของที่ build สร้าง (`viewer.wasm`, `lowweb_res.o`, `lowd.exe`, `ops.wasm`) และผลทดสอบชั่วคราว ลบทิ้งได้ทั้งโฟลเดอร์ (`source-backups.zip` คือ source ก่อนแก้รอบใหญ่ ๆ เก็บไว้เผื่อย้อนดู) |
 | `legacy/paint-html/` | paint เวอร์ชันเดิมที่ยังพึ่ง HTML + JS |
 

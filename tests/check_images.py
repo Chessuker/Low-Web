@@ -77,9 +77,9 @@ cases.append(('anim.webp', f'{out}/anim.webp', 'WEBP'))
 ex = Image.Exif(); ex[0x0112] = 6
 add('exif6.jpg', base.convert('RGB'), 'JPEG', quality=95, exif=ex.tobytes())
 
-# real-world files from the web (tests/samples): WebP must match exactly, JPEG closely
+# files as real encoders write them (tests/samples/gen_*: tests/gen_samples.py): WebP must match exactly, JPEG closely
 import glob, shutil
-for p in sorted(glob.glob('tests/samples/real_*.webp') + glob.glob('tests/samples/real_*.jpg')):
+for p in sorted(glob.glob('tests/samples/gen_*.webp') + glob.glob('tests/samples/gen_*.jpg')):
     name = os.path.basename(p)
     shutil.copy(p, f'{out}/{name}')
     cases.append((name, f'{out}/{name}', 'WEBP' if name.endswith('.webp') else 'JPEG'))
