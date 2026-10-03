@@ -276,7 +276,7 @@ show as annotations.
 | `python tests/run_tests.py [NAME…]` | **Every test that needs no internet**, in one command (ops, viewer, images, stream, cache, cookies, hpack, access, sleep, select, edit, progressive, css, video, history, referer), as CI runs them: run it before committing |
 | `python tests/check_referer.py` | The headers the browser sends (a test server on 2 ports = 2 origins): a Chrome-style User-Agent + `Low-web/0.1`; Referer as browsers send it by default (`strict-origin-when-cross-origin`): the whole address (no #fragment) to the same origin, only the origin to another one, none for a typed address |
 | `python tests/check_history.py` | Back/forward: a link the user clicks adds an entry, but a page that moves on by itself (a `<meta refresh>` like a search engine's redirect page) takes its own place, so Back goes back to the search instead of round to the same page |
-| `python tests/check_video.py` | Video (`tests/samples/colors.mp4`: one second each of red, green, blue and yellow, so a screenshot tells where it is): click to play, Space to pause, a click on the track at 85%, playing to the end, F for fullscreen / Esc, `<audio>`, a missing file says why on its picture, and over slow HTTP (`slow_server.py`) with the picture data 3 MB into the file, which needs a range request; SKIP where Windows has no Media Foundation or the computer no sound device |
+| `python tests/check_video.py` | Video (`tests/samples/colors.mp4`: one second each of red, green, blue and yellow, so a screenshot tells where it is): click to play, Space to pause, a click on the track at 85%, playing to the end, F for fullscreen / Esc, `<audio>`, a missing file says why on its picture, and over slow HTTP (`slow_server.py`) with the picture data 3 MB into the file, which needs a range request; SKIP where Windows has no Media Foundation, and the `<audio>` check is skipped on a computer with no sound device |
 | `python tests/check_css_layout.py` | CSS layout from stylesheets: a page of coloured boxes (a flex row 1:2 + a fixed width + gap, a right float with text around it + clear, a 3-column grid, a carousel in `overflow:hidden`, `justify-content:center`), each box found by its colour in a screenshot |
 | `python tests/check_progressive.py` | Pages loading slowly (`slow_server.py` on a free port): a big table shows rows before the download ends, a page without `<main>` shows its first screen before the end, a `<main>` that comes late still ends in reader view, and the final picture is the same as when loaded at once |
 | `python tests/check_edit.py` | Text fields (typing, arrows, Home/End, Shift to select, Delete/Backspace, cutting, Thai vowels, double-click, drag to select, Tab, textarea), Thai `#fragment`s as characters and as `%`, find in page (count, next/previous, case, not found, text files) |
@@ -311,9 +311,9 @@ show as annotations.
   viewer: 20 seconds) is stopped.
 - No TLS 1.3 yet (Windows 10's SChannel doesn't offer TLS 1.3 to clients, so TLS 1.2 is used).
 - Video plays through Windows' Media Foundation: Windows "N" editions need the Media Feature Pack,
-  computers without a sound device can't play (Media Foundation needs one), and MP4 files with
-  B-frames show the picture a few frames behind the sound (Media Foundation ignores edit lists),
-  and Windows Server may not play MP3 (MP4 with H.264/AAC plays there).
+  computers without a sound device (such as servers) play videos without their sound but can't
+  play audio alone, and MP4 files with B-frames show the picture a few frames behind the sound
+  (Media Foundation ignores edit lists).
   CPU while playing: H.264 640×360 ~5% of one core, Wikipedia's MPEG-4 Part 2 ~14% (decoded on
   the CPU).
 - Pages from the internet are kept away from this computer, the local network and files (see

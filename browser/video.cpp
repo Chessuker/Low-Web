@@ -682,8 +682,10 @@ Info Player::info() {
                 loader_error = p.loader->error;
             }
             HRESULT hr = p.events->error_hr;
-            if (hr == MF_E_NO_AUDIO_PLAYBACK_DEVICE || hr == MF_E_AUDIO_SERVICE_NOT_RUNNING) {
-                p.fail = "this computer has no sound device, and Windows plays videos only with one";
+            // No sound output (no sound device, as on servers): a video plays without its sound,
+            // but there is nothing to play of audio alone (the engine can't make its sink).
+            if (hr == MF_E_NO_AUDIO_PLAYBACK_DEVICE || hr == MF_E_AUDIO_SERVICE_NOT_RUNNING || hr == MF_E_CANNOT_CREATE_SINK) {
+                p.fail = "this computer has no sound device to play it on";
             } else switch (p.events->error) {
             case MF_MEDIA_ENGINE_ERR_NETWORK: p.fail = loader_error.empty() ? "the download failed" : loader_error; break;
             case MF_MEDIA_ENGINE_ERR_DECODE: p.fail = "the file is damaged or can't be decoded"; break;

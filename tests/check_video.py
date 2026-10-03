@@ -3,7 +3,8 @@
 # downloaded (a range request, tests/slow_server.py on a free port). The video is
 # tests/samples/colors.mp4: one second each of red, green, blue and yellow (and a tone), so
 # a screenshot tells where it is. Needs no internet; says SKIP where Windows has no Media
-# Foundation (some servers, "N" editions).
+# Foundation (some servers, "N" editions), and skips <audio> on a computer with no sound device
+# (CI machines: videos play there without their sound).
 import os, re, shutil, socket, subprocess, sys, tempfile, time
 from PIL import Image
 
@@ -14,7 +15,7 @@ BAR = (28, 28, 31)  # the controls' bar
 COLORS = {'red': (255, 0, 0), 'green': (0, 255, 0), 'blue': (0, 0, 255), 'yellow': (255, 255, 0)}
 ORDER = ['red', 'green', 'blue', 'yellow']
 work = tempfile.mkdtemp(prefix='lw-video-')
-for f in ('colors.mp4', 'tone.m4a'):  # (AAC: Windows Server, as on CI, may not play MP3)
+for f in ('colors.mp4', 'tone.m4a'):
     shutil.copy(os.path.join(ROOT, 'tests', 'samples', f), work)
 PAGE = ('<!doctype html><html><head><meta charset="utf-8"><title>video</title></head><body>\n<p>Before the video.</p>\n'
         '<video controls width="320" height="180" src="%s"></video>\n<p>Between.</p>\n<div><audio controls src="tone.m4a"></audio></div>\n'
@@ -158,12 +159,10 @@ try:
         'key 32', 'waitvideo 1 3', 'video',
         'key 70', 'wait 800', 'shot ' + os.path.join(work, 'full.bmp'), 'key 27', 'wait 800', 'shot ' + os.path.join(work, 'back.bmp'),
         'click %d %d' % (au[0] + 15, (au[1] + au[3]) // 2), 'waitvideo 2 2', 'video',
-        'click %d %d' % ((v2[0] + v2[2]) // 2, v2[1] - 50), 'waitvideo 3 4', 'video', 'shot ' + os.path.join(work, 'missing.bmp')])
+        'click %d %d' % ((v2[0] + v2[2]) // 2, v2[1] - 50), 'waitvideo 3 4', 'video', 'wait 500',  # (the page draws the message)
+        'shot ' + os.path.join(work, 'missing.bmp')])
     log = run(base + 'page.html', script)
     st = states(log)
-    if any('no sound device' in s[3] for s in st):  # (CI machines often have none)
-        print('SKIP  this computer has no sound device, which Windows needs to play videos')
-        sys.exit(0)
     one = [s for s in st if s[0] == min(x[0] for x in st)] if st else []
     check('click: it plays; Space: it pauses', len(one) >= 1 and one[0][1] == 1 and 0.8 < one[0][2] < 2.5, one[:1])
     if one:
@@ -181,7 +180,10 @@ try:
           '[low-web] fullscreen\n' in log and '[low-web] fullscreen off' in log and full.width > 800 and len(fb) == 1 and
           fb[0][3] >= full.height - 2 and back.size == Image.open(os.path.join(work, 'paused.bmp')).size, (full.size, fb, back.size))
     audio = [s for s in st if s[0] == min(x[0] for x in st) + 1] if st else []
-    check('<audio>: its button plays it', any(s[1] == 2 for s in audio), audio)
+    if any('no sound device' in s[3] for s in audio):  # (as CI machines: videos play there without their sound)
+        print('skip  <audio>: this computer has no sound device to play it on')
+    else:
+        check('<audio>: its button plays it', any(s[1] == 2 for s in audio), audio)
     missing = [s for s in st if s[0] == min(x[0] for x in st) + 2] if st else []
     check('a missing file: the video says it failed, and why', any(s[1] == 4 and 'not found' in s[3] for s in missing), missing)
     mim = view('missing.bmp')
